@@ -11,7 +11,7 @@ import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSyn
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { buildGraph } from "../src/graph/build.js";
-import { extractCachePath, extractorStamp, readExtractCache, stampDir } from "../src/graph/extract-cache.js";
+import { extractCachePath, extractorStamp, readExtractCache, stampDir, extractInputsKey } from "../src/graph/extract-cache.js";
 import { fingerprintPath, isClean, probeDrift, readFingerprint } from "../src/graph/fingerprint.js";
 import { readAskIndex } from "../src/ask/index-file.js";
 import { readGraph, wiringPath } from "../src/graph/write.js";
@@ -130,7 +130,7 @@ test("adding and deleting files stays consistent with a cold build", async () =>
   const g = readGraph(wiringPath(outOf(d))) as GraphV1;
   assert.ok(!g.nodes.some((n) => n.path === "src/app.ts"), "a deleted file leaves no nodes behind");
 
-  const cache = readExtractCache(outOf(d));
+  const cache = readExtractCache(outOf(d), extractInputsKey(null));
   assert.ok(!("src/app.ts" in cache.files), "and no cache entry");
   const fp = readFingerprint(outOf(d));
   assert.ok(fp && !("src/app.ts" in fp.files), "and no fingerprint entry");
@@ -178,7 +178,7 @@ test("the cache holds pristine Tier-1 output — no enrichment leaks into it", a
   assert.equal(kept?.summary, "adds two numbers", "an unchanged body keeps its summary");
   assert.equal(kept?.summary_state, "ready");
 
-  const cache = readExtractCache(outOf(d));
+  const cache = readExtractCache(outOf(d), extractInputsKey(null));
   const cachedNode = cache.files["src/math.ts"].nodes.find((n) => n.id === "src/math.ts#add");
   assert.ok(cachedNode);
   assert.equal(cachedNode!.summary, null, "the parse memo must not carry meaning-layer state");
@@ -361,7 +361,7 @@ test("a memo written by a different extractor is dropped, not replayed", async (
   assert.ok(Object.keys(cache.files).length > 0);
 
   writeFileSync(path, JSON.stringify({ ...cache, extractor: "deadbeefdeadbeef" }));
-  assert.deepEqual(readExtractCache(outOf(d)).files, {}, "entries from an unknown extractor are worthless");
+  assert.deepEqual(readExtractCache(outOf(d), extractInputsKey(null)).files, {}, "entries from an unknown extractor are worthless");
 
   // So the next build re-parses everything rather than trusting them.
   const cold = await buildGraph(d);

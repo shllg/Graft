@@ -213,6 +213,7 @@ export function resolveEdges(
   // superclass. `extend` is absent by design — it composes the SINGLETON class, and
   // constant lookup walks `cref.ancestors`, which `extend` never touches.
   const rubyAncestors = new Map<string, string[]>();
+  const rubyIncluders = new Map<string, string[]>();
   const NO_ANCESTORS = new Map<string, string[]>();
   const heritageByOwner = new Map<string, { kind: RawEdge["rubyHeritage"]; fqn: string; id: string }[]>();
   for (const e of rawEdges) {
@@ -223,6 +224,11 @@ export function resolveEdges(
     const parentFqn = hit ? rubyFqnOf(hit.id) : null;
     if (!hit || !parentFqn) continue;
     push(heritageByOwner, ownFqn, { kind: e.rubyHeritage, fqn: parentFqn, id: e.source });
+    // The inverse edge, for M2: which classes include this concern. A declaration
+    // inside an `included do` block runs in each of them, so this is the list its
+    // edges get re-attributed across. `extend` is excluded: extending a concern does
+    // not fire its `included` hook, so nothing declared there runs in the extender.
+    if (e.rubyHeritage !== "extend") push(rubyIncluders, hit.id, e.source);
   }
   for (const [ownFqn, entries] of heritageByOwner) {
     const kindOf = (k: RawEdge["rubyHeritage"]) => entries.filter((x) => x.kind === k).map((x) => x.fqn);
@@ -338,6 +344,13 @@ export function resolveEdges(
         // dangling endpoints for exactly that reason.
         const hit = resolveRubyConstant(e.name, e.nesting, e.file, rubyFqn, rubyAncestors, rubyShadow, zeitwerk, true);
         if (hit && hit.id !== e.source) add(e.source, hit.id, "references", hit.confidence);
+      } else if (e.recvType && RB_EXT.test(e.file)) {
+        // M2: `validates :email` names an ATTRIBUTE of this class, not a constant —
+        // owner-qualified, so it resolves exactly like a member call and declines
+        // the same way. Most of these find nothing, because a plain database column
+        // has no node anywhere; that is the correct answer, not a gap.
+        const hit = resolveTypedMember(e.recvType, e.name, e.file, ownerMethod, classParents, classTraits);
+        if (hit && hit !== "ambiguous" && hit.id !== e.source) add(e.source, hit.id, "references", hit.confidence);
       } else if (e.file.endsWith(".php") && byId.get(e.source)?.origin === "ast") {
         // PHP attribute without a `use` import (same-file or globally unique class).
         const refKinds: Kind[] = ["class", "interface", "trait", "enum"];
@@ -370,6 +383,26 @@ export function resolveEdges(
         if (hit && hit.id !== e.source) add(e.source, hit.id, "references", hit.confidence);
       }
     } else if (e.relation === "calls") {
+      if (e.viaConcern) {
+        // Declared inside an `ActiveSupport::Concern`'s `included do`, so the class
+        // that runs it is each INCLUDER, not the concern. Re-resolve per includer
+        // against that class's own method set: `before_save :stamp_audit` binds to
+        // `User#stamp_audit` in one includer and to nothing at all in another that
+        // never defines it, and both of those are the right answer for that class.
+        const includers = rubyIncluders.get(e.source) ?? [];
+        // A concern mixed into a whole model layer would otherwise multiply one
+        // declaration into hundreds of edges. Past the cap the honest output is
+        // none: the declaration is real but the graph stops being a description
+        // and starts being a hub.
+        if (includers.length > RUBY_CONCERN_INCLUDER_CAP) continue;
+        for (const includer of includers) {
+          const recv = byId.get(includer)?.name;
+          if (!recv) continue;
+          const hit = resolveTypedMember(recv, e.name!, byId.get(includer)!.path, ownerMethod, classParents, classTraits, e.argCount);
+          if (hit && hit !== "ambiguous") add(includer, hit.id, "calls", hit.confidence);
+        }
+        continue;
+      }
       if (e.viaMember) {
         if (!e.recvType) continue;
         const hit = resolveTypedMember(e.recvType, e.name!, e.file, ownerMethod, classParents, classTraits, e.argCount);
@@ -451,6 +484,12 @@ const RB_EXT = /\.rb$/i;
  * than any real chain — 64 is roughly four times the widest model in the two
  * evaluation apps — while still bounding a pathological graph. */
 const RUBY_ANCESTOR_CAP = 64;
+
+/** How many includers one `included do` declaration may be re-attributed across.
+ * A concern mixed into an entire model layer would otherwise turn a single line into
+ * hundreds of edges and make the concern a false hub — the exact shape
+ * `relations.ts` excludes `contains` to avoid. Past this, emit nothing. */
+const RUBY_CONCERN_INCLUDER_CAP = 50;
 
 /**
  * The fully-qualified Ruby constant a class/module node defines, read off its id.
@@ -697,7 +736,23 @@ function resolveName(
   const global = (globalName.get(name) ?? []).filter(
     (n) => kinds.includes(n.kind) && reachable(file, n.path),
   );
-  if (global.length === 1) return { id: global[0].id, confidence: "inferred" };
+  // A framework-synthesized method COUNTS toward ambiguity but is never the
+  // cross-file answer. It is declared, not written, and from another file the
+  // bare-name ladder cannot tell `I18n.t(...)` from a `delegate :t, to: :helpers`
+  // forwarder — measured on filewerk-rails, that single delegate absorbed 177 call
+  // edges, a false hub of exactly the shape this project exists to remove. Counting
+  // it toward ambiguity is the other half and matters just as much: once
+  // `has_many :organization` has declared readers on a dozen models, a bare
+  // `organization` genuinely has a dozen possible owners, and saying so drops 60
+  // wrong edges that a unique-name match used to emit with confidence.
+  //
+  // Same-file is untouched above, deliberately: there the declaration is right there
+  // in the source, `t(...)` inside `ApplicationComponent` really is that delegate,
+  // and the match is certain rather than a guess. Everything else waits for M3 to
+  // type the receiver, which is the milestone that owns the question.
+  if (global.length === 1 && global[0].origin !== "synthesized") {
+    return { id: global[0].id, confidence: "inferred" };
+  }
   return null;
 }
 

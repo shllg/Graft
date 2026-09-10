@@ -32,6 +32,10 @@ export interface ZeitwerkMap {
    * because a future milestone (M2's macro targets) needs the root set itself,
    * not just the derived map. */
   roots: readonly string[];
+  /** `inflect.acronym` overrides, keyed by the acronym downcased (`api` → `API`).
+   * Shared with the Rails macro extractor so `has_many :api_clients` infers
+   * `APIClient` and not `ApiClient` — the spec's "one inflector, not two". */
+  acronyms: ReadonlyMap<string, string>;
 }
 
 /**
@@ -90,7 +94,7 @@ export function discoverZeitwerk(root: string, repoFiles: string[]): ZeitwerkMap
     if (inner === "") continue;
     fqnByPath.set(rel, inner.split("/").map((seg) => camelize(seg, acronyms)).join("::"));
   }
-  return { fqnByPath, roots };
+  return { fqnByPath, roots, acronyms };
 }
 
 /**
@@ -174,9 +178,78 @@ function readAcronyms(root: string, relSet: ReadonlySet<string>): Map<string, st
  * per-underscore-segment reading is exact rather than an approximation of the
  * full inflector.
  */
-function camelize(segment: string, acronyms: ReadonlyMap<string, string>): string {
+export function camelize(segment: string, acronyms: ReadonlyMap<string, string>): string {
   return segment
     .split("_")
     .map((word) => acronyms.get(word.toLowerCase()) ?? (word ? word[0].toUpperCase() + word.slice(1) : word))
     .join("");
+}
+
+/**
+ * `items` → `item`, `people` → `person`. ActiveSupport's default singular rules,
+ * which is what Rails itself uses to turn `has_many :people` into `Person`.
+ *
+ * Transcribed rather than approximated on purpose: a hand-rolled `chomp("s")` gets
+ * `people` → `People`, `categories` → `Categorie` and `addresses` → `Addresse`, and
+ * every one of those silently costs an association its target edge. The rules are
+ * ordered — first match wins — exactly as ActiveSupport orders them.
+ *
+ * Being wrong here is cheap and self-correcting: a bad guess produces a constant name
+ * that resolves to nothing, and the caller emits no edge. It can lose an edge; it
+ * cannot invent one.
+ */
+const UNCOUNTABLE = new Set([
+  "equipment", "information", "rice", "money", "species", "series", "fish", "sheep", "news", "data",
+]);
+
+const IRREGULAR = new Map([
+  ["people", "person"], ["men", "man"], ["women", "woman"], ["children", "child"],
+  ["feet", "foot"], ["teeth", "tooth"], ["geese", "goose"], ["mice", "mouse"], ["oxen", "ox"],
+]);
+
+const SINGULAR_RULES: ReadonlyArray<readonly [RegExp, string]> = [
+  [/(quiz)zes$/i, "$1"],
+  [/(matr)ices$/i, "$1ix"],
+  [/(vert|ind)ices$/i, "$1ex"],
+  [/^(ox)en$/i, "$1"],
+  [/(alias|status)(es)?$/i, "$1"],
+  [/(octop|vir)(us|i)$/i, "$1us"],
+  [/^(a)x[ie]s$/i, "$1xis"],
+  [/(cris|test)(is|es)$/i, "$1is"],
+  [/(shoe)s$/i, "$1"],
+  [/(o)es$/i, "$1"],
+  [/(bus)(es)?$/i, "$1"],
+  [/([ml])ice$/i, "$1ouse"],
+  [/(x|ch|ss|sh)es$/i, "$1"],
+  [/(m)ovies$/i, "$1ovie"],
+  [/(s)eries$/i, "$1eries"],
+  [/([^aeiouy]|qu)ies$/i, "$1y"],
+  [/([lr])ves$/i, "$1f"],
+  [/(tive)s$/i, "$1"],
+  [/(hive)s$/i, "$1"],
+  [/([^f])ves$/i, "$1fe"],
+  [/(analy|ba|diagno|parenthe|progno|synop|the)(sis|ses)$/i, "$1sis"],
+  [/([ti])(um|a)$/i, "$1um"],
+  [/(n)ews$/i, "$1ews"],
+  [/(ss)$/i, "$1"],
+  [/s$/i, ""],
+];
+
+export function singularize(word: string): string {
+  const lower = word.toLowerCase();
+  if (UNCOUNTABLE.has(lower)) return word;
+  const irregular = IRREGULAR.get(lower);
+  if (irregular) return irregular;
+  for (const [re, repl] of SINGULAR_RULES) {
+    if (re.test(word)) return word.replace(re, repl);
+  }
+  return word;
+}
+
+/**
+ * The constant an association name implies: `items` → `Item`, `people` → `Person`,
+ * `api_clients` → `APIClient` once `inflect.acronym "API"` is configured.
+ */
+export function associationConstant(name: string, acronyms: ReadonlyMap<string, string>): string {
+  return camelize(singularize(name), acronyms);
 }

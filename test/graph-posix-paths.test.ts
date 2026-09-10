@@ -21,7 +21,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildGraph } from "../src/graph/build.js";
-import { readExtractCache } from "../src/graph/extract-cache.js";
+import { readExtractCache, extractInputsKey } from "../src/graph/extract-cache.js";
 import { readFingerprint } from "../src/graph/fingerprint.js";
 import { readGraph, wiringPath } from "../src/graph/write.js";
 import { buildRepoMap } from "../src/graph/map.js";
@@ -80,7 +80,7 @@ test("the extract cache and fingerprint are keyed by posix paths", async () => {
   await buildGraph(d, { reuse: false });
   const out = outOf(d);
 
-  const cacheKeys = Object.keys(readExtractCache(out).files);
+  const cacheKeys = Object.keys(readExtractCache(out, extractInputsKey(null)).files);
   const printKeys = Object.keys(readFingerprint(out)?.files ?? {});
   assert.ok(cacheKeys.length > 0, "extract cache is empty");
   assert.ok(printKeys.length > 0, "fingerprint is empty");

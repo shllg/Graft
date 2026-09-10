@@ -19,6 +19,7 @@ import Swift from "tree-sitter-swift";
 import PHP from "tree-sitter-php";
 import { basename } from "node:path";
 import { contentHash } from "../util/id.js";
+import { associationConstant } from "./zeitwerk.js";
 import {
   collectBindings,
   goReceiverVarOf,
@@ -174,6 +175,13 @@ export interface RawEdge {
    * records the FQN and declines rather than resolving past it to an unrelated
    * top-level class. Ruby finds the constant here; we simply cannot name it. */
   rubyConstDecl?: boolean;
+  /** Ruby only: this edge was declared inside an `ActiveSupport::Concern`'s
+   * `included do` block, so its real subjects are the classes that INCLUDE the
+   * concern, not the concern itself. `resolve.ts` re-attributes it across the
+   * resolved `extends` edges and drops it entirely when nothing includes the
+   * concern — declining rather than attributing a callback to a module that never
+   * runs it. */
+  viaConcern?: boolean;
 }
 
 export interface ExtractResult {
@@ -458,6 +466,39 @@ export interface WalkCtx {
   // its body cannot see `A::B` or `A`. Both spellings occur in real Rails code
   // and they are not interchangeable — see rubyCref().
   rubyNesting: readonly string[];
+  // Ruby (M2): the Rails context, or null when this repo is not a Rails app.
+  // Its PRESENCE is the gate on the whole ActiveRecord/ActiveSupport vocabulary —
+  // `has_many :items` in a plain gem is an ordinary call to a method the repo
+  // defines, and reading it as an association would invent four methods that do not
+  // exist. Detection happens once per build (see zeitwerk.ts) and is deliberately
+  // conservative; directory shape alone never implies Rails.
+  rubyRails: RailsContext | null;
+  // Ruby (M2): are we inside an ActiveSupport::Concern's `included do ... end`?
+  // That block executes in the INCLUDER, so a callback declared there is a callback
+  // on every class that includes the concern, not on the concern itself. The edges
+  // carry `viaConcern` and resolve.ts re-attributes them across the resolved
+  // `extends` edges M1 produces.
+  rubyIncludedBlock: boolean;
+  // Ruby (M2): the method names the current class/module writes out with a real
+  // `def`. A macro must not synthesize a name the class also defines, because the
+  // `def` OVERRIDES the generated method — that is the whole point of writing it.
+  // Not merely tidier: `Current` in filewerk-rails declares `attribute :organization`
+  // and then defines `def organization=`, and synthesizing anyway minted the
+  // generated node first, handing it the base id and pushing the real method to
+  // `organization=~2`. Every existing reference to that method silently moved.
+  rubyOwnDefs: ReadonlySet<string>;
+}
+
+/** What the Ruby macro extractor needs to know about the surrounding Rails app. */
+export interface RailsContext {
+  /** `inflect.acronym` overrides, so `has_many :api_clients` infers `APIClient`. */
+  acronyms: ReadonlyMap<string, string>;
+}
+
+/** Options threaded into a single file's extraction. Absent → the plain-language
+ * behaviour, which is what every non-Ruby language and every non-Rails repo gets. */
+export interface ExtractOptions {
+  rails?: RailsContext | null;
 }
 
 /** A definition we're about to emit, normalized across the shapes we handle. */
@@ -490,7 +531,7 @@ function parseSource(source: string): Parser.SyntaxNode {
   return parser.parse((index: number) => source.slice(index, index + PARSE_CHUNK)).rootNode;
 }
 
-export function extractFile(rel: string, source: string, lang: Language): ExtractResult {
+export function extractFile(rel: string, source: string, lang: Language, opts: ExtractOptions = {}): ExtractResult {
   parser.setLanguage(GRAMMARS[lang] as never);
   const root = parseSource(source);
   const bindings = collectBindings(root, lang);
@@ -535,6 +576,9 @@ export function extractFile(rel: string, source: string, lang: Language): Extrac
     rubyVisibility: "public",
     rubyPostHoc: EMPTY_MAP,
     rubyNesting: EMPTY_NESTING,
+    rubyRails: opts.rails ?? null,
+    rubyIncludedBlock: false,
+    rubyOwnDefs: EMPTY_SET,
   };
   // Every id minted this file, seeded with the file node's own id (`rel`) so a
   // top-level definition can never collide with it. Threaded as its own
@@ -795,10 +839,21 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
         ctx.lang === "ruby" && (desc.kind === "class" || desc.kind === "module")
           ? rubyPostHocVisibility(node)
           : ctx.rubyPostHoc,
+      rubyOwnDefs:
+        ctx.lang === "ruby" && (desc.kind === "class" || desc.kind === "module")
+          ? rubyOwnDefNames(node)
+          : ctx.rubyOwnDefs,
       rubyNesting:
         ctx.lang === "ruby" && (desc.kind === "class" || desc.kind === "module")
           ? [rubyCref(ctx.rubyNesting[0], idPart), ...ctx.rubyNesting]
           : ctx.rubyNesting,
+      // A class defined inside an `included do` block is its own subject; the
+      // re-attribution applies to declarations made ON the includer, not to
+      // everything lexically underneath the block.
+      rubyIncludedBlock:
+        ctx.lang === "ruby" && (desc.kind === "class" || desc.kind === "module")
+          ? false
+          : ctx.rubyIncludedBlock,
     };
     walkNamedChildren(node.namedChildren, childCtx, out, edges, minted);
     return;
@@ -888,8 +943,39 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
     if (ctx.lang === "ruby" && ctx.enclosingClass !== null) {
       const synthesized = rubySynthesizedMethods(node, ctx);
       if (synthesized.length > 0) {
-        for (const s of synthesized) emitRubySynthesizedMethod(s, ctx, out, edges, minted);
+        for (const s of synthesized) emitRubySynthesizedMethod(s, ctx, out, edges, minted, "ast");
         return;
+      }
+      // An `ActiveSupport::Concern`'s `included do ... end`. Its body is ordinary
+      // class-body syntax, so it is walked with the same ctx plus the marker that
+      // sends whatever it declares to the concern's includers.
+      const includedBody = ctx.rubyRails ? rubyIncludedDoBlock(node) : null;
+      if (includedBody) {
+        for (const child of includedBody.namedChildren) {
+          walk(child, { ...ctx, rubyIncludedBlock: true }, out, edges, minted);
+        }
+        return;
+      }
+      if (ctx.rubyRails) {
+        const macroMethods = rubyMacroMethods(node, ctx);
+        const macroEdges = rubyMacroEdges(node, ctx, ctx.parentId);
+        const declared = macroMethods.filter((m) => !ctx.rubyOwnDefs.has(m.name));
+        if (declared.length > 0 || macroEdges.length > 0) {
+          for (const m of declared) emitRubySynthesizedMethod(m, ctx, out, edges, minted, "synthesized");
+          edges.push(...macroEdges);
+          // An association extension (`has_many :things do def latest; end end`)
+          // carries a block none of the synthesized methods claimed. Walk it under
+          // the CURRENT context — its contents belong to the class, not to any one
+          // generated reader — so consuming the macro never loses what is inside it.
+          const trailing = node.childForFieldName("block");
+          if (trailing && !declared.some((m) => sameSyntaxNode(m.hashNode, trailing))) {
+            for (const child of trailing.namedChildren) walk(child, ctx, out, edges, minted);
+          }
+          // Return, so the macro call does not ALSO become an ordinary call edge to
+          // a function literally named `has_many` — the same reason the mixin and
+          // `attr_*` branches above return.
+          return;
+        }
       }
     }
     const consumedCallee = ctx.lang === "r" && node.type === "call" ? rCalleeName(node) : null;
@@ -2099,6 +2185,37 @@ function rubyPostHocVisibility(classOrModuleNode: Parser.SyntaxNode): ReadonlyMa
   return out;
 }
 
+/**
+ * Every method name this class/module writes out with a real `def`, collected in one
+ * shallow pass when the body is entered — the same shape, and for the same reason, as
+ * {@link rubyPostHocVisibility}: a macro can appear textually before the `def` that
+ * overrides it, so a forward-only walk cannot see it in time.
+ *
+ * Shallow on purpose (direct body children, plus the one level of `body_statement`
+ * the grammar wraps them in). A `def` nested inside a conditional or another method
+ * is not the class's own declaration and must not suppress a macro.
+ */
+function rubyOwnDefNames(classOrModuleNode: Parser.SyntaxNode): ReadonlySet<string> {
+  const body = classOrModuleNode.childForFieldName("body");
+  if (!body) return EMPTY_SET;
+  const out = new Set<string>();
+  const consider = (n: Parser.SyntaxNode): void => {
+    if (n.type === "method" || n.type === "singleton_method") {
+      const name = n.childForFieldName("name")?.text;
+      if (name) out.add(name);
+      return;
+    }
+    // `private def foo` wraps the method in a call; the def is still the class's own.
+    const inline = rubyInlineVisibility(n);
+    if (inline) {
+      const name = inline.methodNode.childForFieldName("name")?.text;
+      if (name) out.add(name);
+    }
+  };
+  for (const stmt of body.namedChildren) consider(stmt);
+  return out;
+}
+
 /** A bare `private`/`protected`/`public` statement (no call, no args) — the
  * mode-switch form. Returns the mode to switch to, or null if `node` isn't
  * one. `module_function` is deliberately NOT handled — it has dual
@@ -2236,12 +2353,258 @@ function rubySynthesizedMethods(node: Parser.SyntaxNode, ctx: WalkCtx): RubySynt
   return [];
 }
 
+/**
+ * The ActiveRecord/ActiveSupport macro vocabulary.
+ *
+ * Rails' implicitness is *conventional*, not dynamic-in-principle: `has_many :items`
+ * is an edge declaration, `before_save :normalize` names a method in the same class,
+ * and `scope :active, -> {}` defines a class method. None of it needs inference — it
+ * needs a parser that knows the words. This is deliberately a table rather than a
+ * pattern: an unknown macro must read as "not ours" and fall through to the ordinary
+ * call path, never as "probably an association."
+ */
+const AR_ASSOCIATIONS = new Set(["belongs_to", "has_one", "has_many", "has_and_belongs_to_many"]);
+/** ActiveRecord's built-in cast types, which is how `attribute :price, :decimal` is
+ * told apart from `attribute :user, :organization` — see the `attribute` branch. */
+const AR_CAST_TYPES = new Set([
+  "string", "text", "integer", "bigint", "float", "decimal", "numeric", "datetime", "time",
+  "date", "boolean", "binary", "json", "jsonb", "uuid", "inet", "cidr", "macaddr", "money",
+  "interval", "point", "line", "box", "hstore", "xml", "tsvector", "daterange", "numrange",
+  "tsrange", "tstzrange", "int4range", "int8range", "array", "immutable_string",
+]);
+const AR_CALLBACKS = new Set([
+  "before_validation", "after_validation",
+  "before_save", "around_save", "after_save",
+  "before_create", "around_create", "after_create",
+  "before_update", "around_update", "after_update",
+  "before_destroy", "around_destroy", "after_destroy",
+  "after_commit", "after_rollback", "after_initialize", "after_find", "after_touch",
+  "before_action", "around_action", "after_action", // ActionController, same shape
+  "validate",
+]);
+
+/** The symbol arguments of a macro call (`:a, :b` → ["a","b"]), ignoring options. */
+function rubySymbolArgs(args: Parser.SyntaxNode | null): string[] {
+  return (args?.namedChildren ?? [])
+    .filter((c) => c.type === "simple_symbol")
+    .map((c) => c.text.slice(1));
+}
+
+/**
+ * A literal option value from a macro's trailing hash (`class_name: "User"`).
+ *
+ * Returns null for anything that is not a plain string or symbol literal — a
+ * constant, a method call, an interpolation. That null is load-bearing: the spec's
+ * "do not synthesize what you cannot name" means the reader methods are still emitted
+ * (Rails defines them regardless) while the target edge is not, because the only
+ * honest description of `class_name: OWNER_CLASS` is that this pass cannot read it.
+ */
+function rubyMacroOption(args: Parser.SyntaxNode | null, key: string): string | null {
+  for (const arg of args?.namedChildren ?? []) {
+    const pairs = arg.type === "hash" ? arg.namedChildren : arg.type === "pair" ? [arg] : [];
+    for (const pair of pairs) {
+      if (pair.type !== "pair") continue;
+      const k = pair.childForFieldName("key");
+      const name = k?.type === "hash_key_symbol" ? k.text : k?.type === "simple_symbol" ? k.text.slice(1) : null;
+      if (name !== key) continue;
+      const v = pair.childForFieldName("value");
+      if (v?.type === "simple_symbol") return v.text.slice(1);
+      if (v?.type !== "string") return null;
+      const content = v.namedChildren.find((c) => c.type === "string_content");
+      // An interpolated string has no single `string_content` covering the whole
+      // literal, so this also rejects `class_name: "#{prefix}User"` — correctly.
+      return content && content.text === v.text.slice(1, -1) ? content.text : null;
+    }
+  }
+  return null;
+}
+
+/** Every `%i[...]`/`%w[...]`/array-of-symbols entry, for `enum`. */
+function rubyEnumValues(node: Parser.SyntaxNode | null): string[] {
+  if (!node) return [];
+  if (node.type === "array" || node.type === "symbol_array" || node.type === "string_array") {
+    return node.namedChildren
+      .map((c) => (c.type === "simple_symbol" ? c.text.slice(1) : c.type === "bare_symbol" || c.type === "bare_string" || c.type === "string_content" ? c.text : null))
+      .filter((x): x is string => !!x);
+  }
+  return [];
+}
+
+/**
+ * The methods a Rails macro declares. Same contract as `rubySynthesizedMethods`,
+ * which is why it returns the same shape and hangs off the same call site — PR #275's
+ * author named this as the follow-up in exactly those terms, and Phase 5's
+ * `attr_accessor` handling is the template rather than a thing to redesign.
+ *
+ * Every node this produces gets `origin: "synthesized"`: there is no `def` anywhere,
+ * and the span points at the macro call, so a reader must be able to tell it from a
+ * method someone actually typed.
+ */
+function rubyMacroMethods(node: Parser.SyntaxNode, ctx: WalkCtx): RubySynthesizedMethod[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || node.childForFieldName("receiver")) return [];
+  const macro = methodNode.text;
+  const args = node.childForFieldName("arguments");
+  const syms = rubySymbolArgs(args);
+  const at = (name: string): RubySynthesizedMethod => ({ name, hashNode: node, headerEnd: node.startIndex });
+
+  if (AR_ASSOCIATIONS.has(macro)) {
+    const name = syms[0];
+    if (!name) return [];
+    const out = [at(name), at(`${name}=`)];
+    if (macro === "belongs_to" || macro === "has_one") {
+      out.push(at(`build_${name}`), at(`create_${name}`));
+      // `reload_x` exists on belongs_to only; has_one gets `reload_x` too in modern
+      // Rails, but only belongs_to is documented for it across the versions this
+      // has to describe, so has_one stops short rather than claiming a method that
+      // may not be there.
+      if (macro === "belongs_to") out.push(at(`reload_${name}`));
+    } else {
+      const singular = associationConstant(name, ctx.rubyRails!.acronyms)
+        .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+        .toLowerCase();
+      out.push(at(`${singular}_ids`), at(`${singular}_ids=`));
+    }
+    return out;
+  }
+
+  if (macro === "scope" || macro === "default_scope") {
+    // A scope's lambda IS the method's body, so the node spans the lambda and the
+    // walk descends into it — the same shape `define_method` already uses, and the
+    // reason matters: consuming the macro without descending silently drops every
+    // call inside the scope. Measured, not theoretical — `scope :for_organization,
+    // ->(org) { ... Current.system_admin? }` in filewerk-rails lost its call edge
+    // that way, and the eval caught it as two missing answers.
+    const body = rubyLambdaBody(args);
+    const name = macro === "default_scope" ? "default_scope" : syms[0];
+    if (!name) return [];
+    return body
+      ? [{ name, hashNode: body, headerEnd: body.startIndex }]
+      : [at(name)];
+  }
+  if (macro === "attribute") {
+    // Two macros share this name and they disagree about their own arguments.
+    // ActiveRecord's is `attribute :price, :decimal` — one attribute, then a CAST
+    // TYPE. ActiveSupport::CurrentAttributes' is `attribute :user, :organization,
+    // :system_admin` — every symbol is an attribute. Reading the second as the first
+    // is not hypothetical: filewerk-rails' `Current` declares five that way, and
+    // taking only the head would arbitrarily grant `user` its reader while denying
+    // `organization` one, purely on argument order.
+    //
+    // The types are a closed, known set, so the trailing symbols answer it: all of
+    // them types means the ActiveRecord form, anything else means they are names.
+    const names = syms.length > 1 && syms.slice(1).every((t) => AR_CAST_TYPES.has(t)) ? syms.slice(0, 1) : syms;
+    return names.flatMap((n) => [at(n), at(`${n}=`)]);
+  }
+  if (macro === "store_accessor") {
+    // The store column itself is an ordinary attribute; the rest are its keys.
+    return syms.flatMap((sN) => [at(sN), at(`${sN}=`)]);
+  }
+  if (macro === "delegate") {
+    // `delegate :name, :email, to: :user` — every symbol except the `to:` target,
+    // which lives in the options hash and is therefore not in `syms`.
+    return syms.map((sN) => at(sN));
+  }
+  if (macro === "enum") {
+    // Two spellings: `enum status: %i[draft live]` (classic) and
+    // `enum :status, %i[draft live]` (Rails 7+). Both declare the same methods.
+    let values: string[] = [];
+    for (const arg of args?.namedChildren ?? []) {
+      const pairs = arg.type === "hash" ? arg.namedChildren : arg.type === "pair" ? [arg] : [];
+      for (const pair of pairs) if (pair.type === "pair") values.push(...rubyEnumValues(pair.childForFieldName("value")));
+      values.push(...rubyEnumValues(arg));
+    }
+    return values.flatMap((v) => [at(v), at(`${v}?`), at(`${v}!`)]);
+  }
+  return [];
+}
+
+/**
+ * The edges a Rails macro declares, as opposed to the methods.
+ *
+ * `classId` is the enclosing class/module node — the declaration site, which is what
+ * a `callers` query on an association should surface.
+ */
+function rubyMacroEdges(node: Parser.SyntaxNode, ctx: WalkCtx, classId: string): RawEdge[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || node.childForFieldName("receiver")) return [];
+  const macro = methodNode.text;
+  const args = node.childForFieldName("arguments");
+  const syms = rubySymbolArgs(args);
+  const out: RawEdge[] = [];
+
+  if (AR_ASSOCIATIONS.has(macro) && syms[0]) {
+    const explicit = rubyMacroOption(args, "class_name");
+    // A `class_name:` key that is present but unreadable means "cannot name it" —
+    // and must NOT fall back to the inflected guess, or an explicitly-overridden
+    // association silently points at whatever the plural happened to imply.
+    const hasClassNameKey = /(^|[\s(,])class_name:/.test(node.text);
+    if (explicit === null && hasClassNameKey) return out;
+    const target = explicit ?? associationConstant(syms[0], ctx.rubyRails!.acronyms);
+    out.push({
+      source: classId, relation: "references", name: target, file: ctx.rel,
+      nesting: [...ctx.rubyNesting], // resolved by M1's constant resolver, never by bare name
+    });
+    return out;
+  }
+
+  if (AR_CALLBACKS.has(macro)) {
+    // The sleeper win: `before_save :normalize_email` is a symbol literal that
+    // nothing connects to `def normalize_email`, and it is unambiguous. Spelled as
+    // a member call on the enclosing class so it resolves owner-qualified — which
+    // also walks the superclass chain — and declines when no such method exists.
+    for (const sym of syms) {
+      out.push({
+        source: classId, relation: "calls", name: sym, file: ctx.rel,
+        viaMember: true, recvType: ctx.enclosingClass!,
+        ...(ctx.rubyIncludedBlock ? { viaConcern: true } : {}),
+      });
+    }
+    return out;
+  }
+
+  if (macro === "validates" || macro === "validates_presence_of") {
+    // Points at the attribute when one exists as a node — usually only when it was
+    // itself declared by a macro (`attribute :email`) or written by hand. A plain DB
+    // column has no node, so most of these resolve to nothing, which is correct.
+    for (const sym of syms) {
+      out.push({
+        source: classId, relation: "references", name: sym, file: ctx.rel,
+        recvType: ctx.enclosingClass!,
+      });
+    }
+    return out;
+  }
+  return out;
+}
+
+/** The `{ ... }` / `do ... end` body of a lambda argument, which is what a `scope`
+ * macro's second argument always is. Null when the macro was given something else
+ * (a symbol, a method reference), in which case there is no body to descend into. */
+function rubyLambdaBody(args: Parser.SyntaxNode | null): Parser.SyntaxNode | null {
+  for (const arg of args?.namedChildren ?? []) {
+    if (arg.type !== "lambda") continue;
+    const body = arg.childForFieldName("body");
+    if (body) return body;
+  }
+  return null;
+}
+
+/** Is this node the `included do ... end` block of an `ActiveSupport::Concern`? */
+function rubyIncludedDoBlock(node: Parser.SyntaxNode): Parser.SyntaxNode | null {
+  if (node.type !== "call") return null;
+  const m = node.childForFieldName("method");
+  if (m?.type !== "identifier" || m.text !== "included" || node.childForFieldName("receiver")) return null;
+  return node.childForFieldName("block") ?? null;
+}
+
 function emitRubySynthesizedMethod(
   m: RubySynthesizedMethod,
   ctx: WalkCtx,
   out: NodeV1[],
   edges: RawEdge[],
   minted: Set<string>,
+  origin: NodeV1["origin"],
 ): void {
   const base = `${ctx.rel}#${[...ctx.scope, m.name].join(".")}`;
   const id = mintId(base, minted);
@@ -2253,7 +2616,7 @@ function emitRubySynthesizedMethod(
     span: `L${m.hashNode.startPosition.row + 1}-L${m.hashNode.endPosition.row + 1}`,
     signature: clean(ctx.source.slice(m.hashNode.startIndex, m.headerEnd)),
     exported: rubyExported(m.name, ctx),
-    origin: "ast",
+    origin,
     body_hash: contentHash(m.hashNode.text),
     body_text: searchBody(m.hashNode.text),
     summary_state: "pending",

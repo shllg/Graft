@@ -26,6 +26,7 @@ import { readSourceFile } from "../util/source.js";
 import { readFollowNestedRepos, readFollowSubmodules, readIncludeDirs } from "../util/state.js";
 import {
   emptyExtractCache,
+  extractInputsKey,
   readExtractCache,
   writeExtractCache,
   type ExtractEntry,
@@ -166,6 +167,13 @@ export async function buildGraph(
   const repoFiles = filterByOnlyDirs(walked, root, onlyDirs);
   const files = listSourceStats(root, outDir, repoFiles);
   const discoveredScopes = discoverScopes(root, repoFiles);
+  // Rails detection is a repo-level fact and both halves of the pipeline need it:
+  // extraction, to know that `has_many :items` is a declaration rather than a call,
+  // and resolution, to use the autoload map as a tiebreak. Discovered once.
+  const zeitwerk = discoverZeitwerk(root, repoFiles);
+  const rails = zeitwerk ? { acronyms: zeitwerk.acronyms } : null;
+  // What the memo must turn over on when it changes — see ExtractCache.inputs.
+  const extractInputs = extractInputsKey(rails);
 
   const nodes: NodeV1[] = [];
   const rawEdges: RawEdge[] = [];
@@ -186,7 +194,7 @@ export async function buildGraph(
   // Tier-1 memo: unchanged files replay their last parse. `entries` is rebuilt
   // from scratch each run and keyed only by files currently on disk, so deletions
   // fall out of both the cache and the fingerprint with no separate pruning pass.
-  const priorExtract = opts.reuse === false ? emptyExtractCache() : readExtractCache(outDir);
+  const priorExtract = opts.reuse === false ? emptyExtractCache() : readExtractCache(outDir, extractInputs);
   const entries: Record<string, ExtractEntry> = {};
   let parsed = 0;
   let reused = 0;
@@ -262,7 +270,7 @@ export async function buildGraph(
     parsed++;
     try {
       const { nodes: fileNodes, rawEdges: fileEdges } = lang
-        ? extractFile(rel, source, lang)
+        ? extractFile(rel, source, lang, { rails })
         : container
           ? extractContainer(rel, source, container)
           : extractGeneric(rel, source, generic!.name);
@@ -286,15 +294,13 @@ export async function buildGraph(
   // strictly about not re-parsing.
   writeExtractCache(outDir, {
     ...emptyExtractCache(),
+    inputs: extractInputs,
     files: entries,
   });
 
   const edges = resolveEdges(nodes, rawEdges, {
     goModules: readGoModules(root, repoFiles),
-    // The same single enumeration every other repo-wide pass takes, for the same
-    // reason: an ignored or vendored `app/` tree must not contribute autoload
-    // roots that extraction itself never saw.
-    zeitwerk: discoverZeitwerk(root, repoFiles),
+    zeitwerk,
   });
 
   // Guard 5 (minimum-substance): node counts aren't known until nodes are

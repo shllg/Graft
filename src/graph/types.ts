@@ -69,7 +69,15 @@ export interface NodeV1 {
   // How the node was extracted. "ast" = a first-class hand-written extractor
   // (TS/JS/Python/Go, full-fidelity). "generic" = the tags.scm breadth tier
   // (signature-only; symbols + bare edges, no scope-aware binding).
-  origin: "ast" | "generic";
+  // "synthesized" = declared by a framework macro rather than written down —
+  // `has_many :items` really does define `items`/`item_ids`, but there is no `def`
+  // anywhere and the node's span points at the macro call site instead. Kept
+  // distinct from "ast" so a reader can tell a generated `items` from a hand-written
+  // one, and so a consumer that wants only code a human typed can filter for it.
+  // Ruby's `attr_accessor` synthesis (M0 Phase 5) deliberately stays "ast": it
+  // predates this value, it is plain Ruby rather than a framework vocabulary, and
+  // re-stamping it would churn every existing Ruby graph for no new information.
+  origin: "ast" | "generic" | "synthesized";
   body_hash: string; // sha256 of the definition text; the Tier-2 re-run trigger
   chars?: number; // byte length of the WHOLE file (file nodes only); the baseline
   //                 `ask` uses to estimate tokens saved vs reading the file whole

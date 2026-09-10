@@ -33,7 +33,7 @@ import type { RawEdge } from "./extract.js";
 import type { NodeV1 } from "./types.js";
 
 /** Bump when the on-disk shape below changes. */
-const CACHE_VERSION = 1;
+const CACHE_VERSION = 2;
 export const EXTRACT_CACHE_PREFIX = "extract";
 
 export interface ExtractEntry {
@@ -54,6 +54,14 @@ export interface ExtractCache {
   version: number;
   /** Identity of the extractor that produced these entries. */
   extractor: string;
+  /** Identity of the repo-level EXTRACTION INPUTS, as opposed to the extractor's own
+   * code: today, whether this is a Rails app and which acronyms its inflector knows.
+   * `extractorStamp()` hashes graft's modules and so cannot see any of that, which
+   * means adding a `config/application.rb` to a repo would otherwise replay every
+   * file's non-Rails parse forever. Same failure mode the stamp's own doc comment
+   * rejects for mtimes: too loose in the direction that silently serves stale
+   * output. */
+  inputs: string;
   /** repo-relative source path → its last parse. */
   files: Record<string, ExtractEntry>;
 }
@@ -188,22 +196,35 @@ function packageVersion(graphDir: string): string | null {
 }
 
 export function emptyExtractCache(): ExtractCache {
-  return { version: CACHE_VERSION, extractor: extractorStamp() ?? "", files: {} };
+  return { version: CACHE_VERSION, extractor: extractorStamp() ?? "", inputs: "", files: {} };
 }
 
 /** The cache for `outDir`, or an empty one when it's absent, unparseable, written by
  * a different cache version, or when this graft has no identity to key on (then
  * every build is cold, which is slow but never wrong). The stamp is in the filename,
  * so the `extractor` field is a second check rather than the only one. */
-export function readExtractCache(outDir: string): ExtractCache {
+/**
+ * The identity of the repo-level extraction INPUTS — see {@link ExtractCache.inputs}.
+ * Exported so build and any caller reading the memo derive it the same way instead of
+ * spelling the string twice; a caller that guesses it wrong silently gets a cold
+ * build, which is slow but never wrong.
+ */
+export function extractInputsKey(rails: { acronyms: ReadonlyMap<string, string> } | null): string {
+  return rails ? `rails:${[...rails.acronyms.keys()].sort().join(",")}` : "plain";
+}
+
+export function readExtractCache(outDir: string, inputs: string): ExtractCache {
   const path = extractCachePath(outDir);
   const stamp = extractorStamp();
   if (path === null || stamp === null) return emptyExtractCache();
   const c = readJson<ExtractCache>(path);
-  if (!c || c.version !== CACHE_VERSION || c.extractor !== stamp || typeof c.files !== "object") {
+  if (
+    !c || c.version !== CACHE_VERSION || c.extractor !== stamp ||
+    c.inputs !== inputs || typeof c.files !== "object"
+  ) {
     return emptyExtractCache();
   }
-  return { version: c.version, extractor: c.extractor, files: c.files ?? {} };
+  return { version: c.version, extractor: c.extractor, inputs: c.inputs, files: c.files ?? {} };
 }
 
 /** Best-effort write — a full graph is already on disk by the time this runs, so an
