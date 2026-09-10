@@ -190,15 +190,51 @@ export function resolveEdges(
   // lookup with the ancestor step disabled, which terminates by construction and
   // costs one extra pass over the (small) heritage subset.
   const zeitwerk = opts.zeitwerk ?? null;
+
+  // Constant ASSIGNMENTS, as fully-qualified names. These are declarations Ruby's
+  // lookup finds but the graph cannot point at — `MAX = 10` has no node — so they
+  // exist only to make the search stop where Ruby stops. See `RawEdge.rubyConstDecl`.
+  const rubyShadow = new Set<string>();
+  for (const e of rawEdges) {
+    if (!e.rubyConstDecl || !e.name) continue;
+    const cref = e.nesting?.[0];
+    rubyShadow.add(cref ? `${cref}::${e.name}` : e.name);
+  }
+
+  // Ruby ancestors, FQN-keyed, for step 2 of the constant lookup. Built from the
+  // heritage edges themselves in a pre-pass, because the answer is needed BEFORE
+  // the main loop resolves them — a constant may only be visible through the very
+  // superclass whose own name is a constant reference. The pre-pass runs the same
+  // lookup with the ancestor step disabled, which terminates by construction and
+  // costs one extra pass over the (small) heritage subset.
+  //
+  // Order is Ruby's, not emission order: `prepend`s (reverse declaration order),
+  // then the class itself, then `include`s (reverse declaration order), then the
+  // superclass. `extend` is absent by design — it composes the SINGLETON class, and
+  // constant lookup walks `cref.ancestors`, which `extend` never touches.
   const rubyAncestors = new Map<string, string[]>();
   const NO_ANCESTORS = new Map<string, string[]>();
+  const heritageByOwner = new Map<string, { kind: RawEdge["rubyHeritage"]; fqn: string; id: string }[]>();
   for (const e of rawEdges) {
     if (e.relation !== "extends" || !e.name || !e.nesting) continue;
     const ownFqn = rubyFqnOf(e.source);
     if (!ownFqn) continue;
-    const hit = resolveRubyConstant(e.name, e.nesting, e.file, rubyFqn, NO_ANCESTORS, zeitwerk, false);
+    const hit = resolveRubyConstant(e.name, e.nesting, e.file, rubyFqn, NO_ANCESTORS, rubyShadow, zeitwerk, false);
     const parentFqn = hit ? rubyFqnOf(hit.id) : null;
-    if (parentFqn) push(rubyAncestors, ownFqn, parentFqn);
+    if (!hit || !parentFqn) continue;
+    push(heritageByOwner, ownFqn, { kind: e.rubyHeritage, fqn: parentFqn, id: e.source });
+  }
+  for (const [ownFqn, entries] of heritageByOwner) {
+    const kindOf = (k: RawEdge["rubyHeritage"]) => entries.filter((x) => x.kind === k).map((x) => x.fqn);
+    // A graph built before `rubyHeritage` existed tags nothing; those edges keep
+    // their emission order rather than being silently reordered into a guess.
+    const untagged = entries.filter((x) => x.kind === undefined).map((x) => x.fqn);
+    rubyAncestors.set(ownFqn, [
+      ...kindOf("prepend").reverse(),
+      ...kindOf("include").reverse(),
+      ...kindOf("superclass"),
+      ...untagged,
+    ]);
   }
 
   // classParents: class/interface name → its declared base-class names, from raw
@@ -275,7 +311,7 @@ export function resolveEdges(
       // globally unique. It declines rather than guesses, and then M0's own
       // resolution runs unchanged — so nothing this cannot answer regresses.
       const constHit = e.nesting
-        ? resolveRubyConstant(e.name!, e.nesting, e.file, rubyFqn, rubyAncestors, zeitwerk, true)
+        ? resolveRubyConstant(e.name!, e.nesting, e.file, rubyFqn, rubyAncestors, rubyShadow, zeitwerk, true)
         : null;
       const hit = constHit ?? resolveName(e.name!, e.file, kinds, perFileName, globalName);
       // an unresolved base is usually an external/imported type — keep the name.
@@ -300,7 +336,7 @@ export function resolveEdges(
         // `references` target that is not a node id would put `ActiveRecord::Base`
         // into the graph as a phantom, and `graph-quality --strict` counts
         // dangling endpoints for exactly that reason.
-        const hit = resolveRubyConstant(e.name, e.nesting, e.file, rubyFqn, rubyAncestors, zeitwerk, true);
+        const hit = resolveRubyConstant(e.name, e.nesting, e.file, rubyFqn, rubyAncestors, rubyShadow, zeitwerk, true);
         if (hit && hit.id !== e.source) add(e.source, hit.id, "references", hit.confidence);
       } else if (e.file.endsWith(".php") && byId.get(e.source)?.origin === "ast") {
         // PHP attribute without a `use` import (same-file or globally unique class).
@@ -406,11 +442,15 @@ export function resolveEdges(
  * bodies and no autoload home, so they are deliberately not constants' definitions. */
 const RB_EXT = /\.rb$/i;
 
-/** How far the ancestor step walks. Same bound and the same reason as
- * `resolveTypedMember`: a deep chain is a sign of a modelling problem, not of a
- * constant that needs finding, and an unbounded walk on a Rails app with dozens of
- * concerns per model is a real cost. */
-const RUBY_ANCESTOR_DEPTH = 3;
+/** How many ancestors the step-2 walk may examine before it gives up.
+ *
+ * A cap on the TOTAL, not on the depth: a Rails model with a dozen concerns is
+ * three levels deep and wide, and cutting it off by depth stopped the search in the
+ * middle of a chain that had further to run. Hitting this cap makes the whole lookup
+ * decline (see `ancestorPrefixes`), so the number only has to be comfortably larger
+ * than any real chain — 64 is roughly four times the widest model in the two
+ * evaluation apps — while still bounding a pathological graph. */
+const RUBY_ANCESTOR_CAP = 64;
 
 /**
  * The fully-qualified Ruby constant a class/module node defines, read off its id.
@@ -468,16 +508,26 @@ function pickRubyConstant(
  * Resolve a Ruby constant reference the way Ruby resolves it.
  *
  *   1. `Module.nesting`, innermost first.
- *   2. The innermost cref's ancestors — superclass chain and included modules.
+ *   2. The innermost cref's ancestors — prepends, then the class, then includes,
+ *      then the superclass chain.
  *   3. Top level.
  *
  * `::X` skips straight to step 3, which is what the programmer wrote it for.
  *
- * One deliberate simplification: Ruby resolves the HEAD of `A::B::C` at each
- * level and then walks down from there, raising NameError if the tail is missing.
- * This tries the whole path at each level instead, so where Ruby would stop and
- * fail, this continues to the next prefix. The two differ only on code that
- * raises at runtime, and the graph's job is to describe code that works.
+ * **The HEAD decides, and then it commits.** For `A::B::C`, Ruby resolves `A` by
+ * steps 1–3 and then looks for `B` inside whatever that turned out to be — it never
+ * reconsiders an outer `A`. Trying the whole dotted path at each level instead reads
+ * as a harmless shortcut and is not: with `module A; class B < Base; end; end`, where
+ * `Base` defines `X`, and an unrelated top-level `B::X`, `B::X` written inside `A` is
+ * `Base::X` in Ruby and was the unrelated one here. That is valid, running code, not
+ * the NameError case the shortcut was justified by. So the head is resolved first and
+ * the tail is looked up strictly within it (and its ancestors — which is how the
+ * inherited `X` is found), declining when the tail is not there.
+ *
+ * The one place the whole path is still tried at every level is when the head names
+ * nothing in the graph at all: `class Billing::Invoice` in compact form defines no
+ * `Billing` node for Zeitwerk's implicit namespace, so there is no commit point to
+ * honour and the flat scan is the only evidence available.
  */
 function resolveRubyConstant(
   ref: string,
@@ -485,42 +535,128 @@ function resolveRubyConstant(
   file: string,
   fqnIndex: Map<string, NodeV1[]>,
   ancestors: Map<string, string[]>,
+  shadow: ReadonlySet<string>,
   zeitwerk: ZeitwerkMap | null,
   useAncestors: boolean,
 ): { id: string; confidence: EdgeV1["confidence"] } | null {
   const absolute = ref.startsWith("::");
   const bare = absolute ? ref.slice(2) : ref;
-  const prefixes = absolute
-    ? [""]
-    : [...nesting, ...(useAncestors ? ancestorPrefixes(nesting[0], ancestors) : []), ""];
+  const segments = bare.split("::");
+  const anc = absolute || !useAncestors ? { prefixes: [], truncated: false } : ancestorPrefixes(nesting[0], ancestors);
+  // A walk that ran out of budget did not prove the constant is absent from the
+  // chain, so it may not fall through to the top level and answer a different
+  // question. Decline instead — the whole point of step 2 is that step 3 is only
+  // correct once step 2 has been exhausted.
+  if (anc.truncated) return null;
+  const prefixes = absolute ? [""] : [...nesting, ...anc.prefixes, ""];
+
+  /** One lookup at one fully-qualified name, honouring shadowing declarations. */
+  const at = (fqn: string): { id: string; confidence: EdgeV1["confidence"] } | "ambiguous" | null => {
+    const hit = pickRubyConstant(fqnIndex.get(fqn), file, fqn, zeitwerk);
+    if (hit) return hit;
+    // `X = 123` here means Ruby's search ends here. There is no node to name, so
+    // the honest answer is no edge — never the outer constant Ruby would not reach.
+    return shadow.has(fqn) ? "ambiguous" : null;
+  };
+  /** Does anything at all declare this constant? Deliberately weaker than `at`.
+   *
+   * A namespace on the way to the target does not have to be pinned to ONE node,
+   * only to exist: `module App` is reopened by every controller file in a Rails
+   * app, and asking `at` to choose between twenty of them reports "ambiguous" for
+   * what is a single reopened constant. Requiring that here cost `App::BaseController`
+   * every one of its compact-form subclasses — the tail was never even reached. The
+   * terminal segment is still resolved through `at`, because that is the one an edge
+   * actually points at. */
+  const declares = (fqn: string): boolean => fqnIndex.has(fqn) || shadow.has(fqn);
+
+  for (const prefix of prefixes) {
+    const headFqn = prefix ? `${prefix}::${segments[0]}` : segments[0];
+    if (segments.length === 1) {
+      const head = at(headFqn);
+      if (head === "ambiguous") return null; // found here, but undecidable — never guess past it
+      if (head) return head;
+      continue;
+    }
+    if (!declares(headFqn)) continue;
+    return resolveRubyQualified(headFqn, segments.slice(1), at, declares, ancestors);
+  }
+
+  // The head names nothing in the graph — an implicit Zeitwerk namespace, a gem, or
+  // stdlib. Fall back to the flat scan, which at least matches a compact-form
+  // definition (`class Billing::Invoice`) that contributes no node for its own head.
+  if (segments.length === 1) return null;
   for (const prefix of prefixes) {
     const fqn = prefix ? `${prefix}::${bare}` : bare;
-    const hit = pickRubyConstant(fqnIndex.get(fqn), file, fqn, zeitwerk);
-    if (hit === "ambiguous") return null; // found here, but undecidable — never guess past it
+    const hit = at(fqn);
+    if (hit === "ambiguous") return null;
     if (hit) return hit;
   }
   return null;
 }
 
-/** The innermost cref's ancestors, nearest first, bounded and cycle-guarded. */
-function ancestorPrefixes(cref: string | undefined, ancestors: Map<string, string[]>): string[] {
-  if (!cref) return [];
+/**
+ * The tail of a qualified reference, resolved strictly inside the namespace its head
+ * resolved to. Each segment is looked for in that namespace and then in its ancestors
+ * — `A::B::X` finds an `X` that `B`'s superclass defines — and never at top level:
+ * Ruby 2.5 removed the toplevel fallback for qualified names.
+ *
+ * The whole remaining path is tried before descending one segment, so an intermediate
+ * namespace that exists only implicitly (`class A::B::C` in compact form mints no
+ * `A::B` node) still resolves.
+ */
+function resolveRubyQualified(
+  headFqn: string,
+  tail: readonly string[],
+  at: (fqn: string) => { id: string; confidence: EdgeV1["confidence"] } | "ambiguous" | null,
+  declares: (fqn: string) => boolean,
+  ancestors: Map<string, string[]>,
+): { id: string; confidence: EdgeV1["confidence"] } | null {
+  let cur = headFqn;
+  for (let i = 0; i < tail.length; i++) {
+    const walk = ancestorPrefixes(cur, ancestors);
+    if (walk.truncated) return null;
+    const scopes = [cur, ...walk.prefixes];
+    const rest = tail.slice(i).join("::");
+    for (const scope of scopes) {
+      const whole = at(`${scope}::${rest}`);
+      if (whole === "ambiguous") return null;
+      if (whole) return whole;
+    }
+    // Not the terminal, so existence is enough — same reason as `declares`.
+    const next = scopes.map((s) => `${s}::${tail[i]}`).find(declares);
+    if (!next) return null; // Ruby raises NameError here; the graph declines
+    cur = next;
+  }
+  return null;
+}
+
+/**
+ * A cref's ancestors, nearest first, cycle-guarded and bounded.
+ *
+ * `truncated` says the cap stopped the walk with ancestors still unexamined. A
+ * caller must treat that as "unknown", not as "absent" — see `resolveRubyConstant`.
+ */
+function ancestorPrefixes(
+  cref: string | undefined,
+  ancestors: Map<string, string[]>,
+): { prefixes: string[]; truncated: boolean } {
+  if (!cref) return { prefixes: [], truncated: false };
   const out: string[] = [];
   const seen = new Set<string>([cref]);
-  let frontier = [cref];
-  for (let depth = 0; depth < RUBY_ANCESTOR_DEPTH && frontier.length; depth++) {
-    const next: string[] = [];
-    for (const c of frontier) {
-      for (const parent of ancestors.get(c) ?? []) {
-        if (seen.has(parent)) continue;
-        seen.add(parent);
-        out.push(parent);
-        next.push(parent);
-      }
+  // Breadth-first over a per-class list that is already in Ruby's own order, which
+  // keeps the linearization right for the shapes that occur: a class's own mixins
+  // all precede anything reached through its superclass.
+  const queue = [cref];
+  for (let i = 0; i < queue.length; i++) {
+    for (const parent of ancestors.get(queue[i]) ?? []) {
+      if (seen.has(parent)) continue;
+      if (out.length >= RUBY_ANCESTOR_CAP) return { prefixes: out, truncated: true };
+      seen.add(parent);
+      out.push(parent);
+      queue.push(parent);
     }
-    frontier = next;
   }
-  return out;
+  return { prefixes: out, truncated: false };
 }
 
 function push<T>(map: Map<string, T[]>, key: string, val: T): void {

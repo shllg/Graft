@@ -159,6 +159,21 @@ export interface RawEdge {
    * ladder. Its presence — not the language of the file — is the switch, so a
    * graph built before this field resolves exactly as it did before. */
   nesting?: string[];
+  /** Ruby only: which heritage form produced this `extends` edge. The graph relation
+   * is the same for all four, but Ruby's CONSTANT lookup is not: `prepend`ed modules
+   * come before the class, `include`d ones after it (both in reverse declaration
+   * order), the superclass last — and `extend` contributes nothing at all, because it
+   * targets the singleton class and `Module.nesting`'s step 2 walks `cref.ancestors`.
+   * Resolving `Inner` inside `class Child < Base; include Mix; end` to `Base::Inner`
+   * when Ruby says `Mix::Inner` is a wrong edge, not a missing one, so the order is
+   * reconstructed in `resolve.ts` from this tag rather than from emission order. */
+  rubyHeritage?: "superclass" | "include" | "prepend" | "extend";
+  /** Ruby only: this edge is a constant ASSIGNMENT (`MAX = 10`), not a reference.
+   * It never becomes a graph edge — the value has no node to point at — but the
+   * declaration still shadows every outer constant of that name, so `resolve.ts`
+   * records the FQN and declines rather than resolving past it to an unrelated
+   * top-level class. Ruby finds the constant here; we simply cannot name it. */
+  rubyConstDecl?: boolean;
 }
 
 export interface ExtractResult {
@@ -856,15 +871,16 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
     // find its public=/private=/active= arguments (there's no other path to
     // them), and it must not ALSO be treated as an ordinary call to a
     // function literally named "R6Class"/"list".
-    const rubyMixins = ctx.lang === "ruby" && ctx.enclosingClass !== null ? rubyMixinTargets(node) : [];
-    if (rubyMixins.length > 0) {
-      for (const target of rubyMixins) {
+    const rubyMixins = ctx.lang === "ruby" && ctx.enclosingClass !== null ? rubyMixinTargets(node) : null;
+    if (rubyMixins) {
+      for (const target of rubyMixins.targets) {
         edges.push({
           source: ctx.parentId,
           relation: "extends",
           name: target,
           file: ctx.rel,
           nesting: [...ctx.rubyNesting],
+          rubyHeritage: rubyMixins.keyword,
         });
       }
       return;
@@ -979,6 +995,22 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
         name: path,
         file: ctx.rel,
         nesting: [...ctx.rubyNesting],
+      });
+    } else if (node.type === "constant" && isRubyConstantAssignment(node)) {
+      // `MAX = 10` defines a constant that no node can represent — the value is an
+      // integer, not a symbol. It still SHADOWS: `X` inside `module A` that declares
+      // `X = 123` is `A::X`, and must never resolve to an unrelated top-level
+      // `class X`. Recording the declaration lets resolve.ts stop at the level Ruby
+      // stops at instead of walking past it. Bare names only: a qualified
+      // `A::X = 1` would need its own head resolved to know what it declares, and
+      // the shadowing case that actually occurs in Rails code is the bare one.
+      edges.push({
+        source: ctx.parentId,
+        relation: "references",
+        name: node.text,
+        file: ctx.rel,
+        nesting: [...ctx.rubyNesting],
+        rubyConstDecl: true,
       });
     }
     return;
@@ -2015,6 +2047,16 @@ function isRubyConstantDefinition(node: Parser.SyntaxNode): boolean {
 }
 
 /**
+ * Is this constant the left-hand side of an assignment — `MAX = 10` rather than
+ * `class Max`? The distinction matters only for shadowing: see `RawEdge.rubyConstDecl`.
+ */
+function isRubyConstantAssignment(node: Parser.SyntaxNode): boolean {
+  const parent = node.parent;
+  if (parent?.type !== "assignment" && parent?.type !== "operator_assignment") return false;
+  return sameSyntaxNode(parent.childForFieldName("left"), node);
+}
+
+/**
  * `initialize` is unconditionally private by Ruby language rule, regardless
  * of the surrounding visibility mode. Otherwise: a post-hoc `private
  * :name`/`protected :name` in the current class/module body wins over the
@@ -2126,25 +2168,34 @@ function rubyCallee(node: Parser.SyntaxNode): { name: string; viaMember: boolean
   return { name: methodNode.text, viaMember: false, kinds: ["function", "method"] };
 }
 
-const RUBY_MIXIN_KEYWORDS = new Set(["include", "extend", "prepend"]);
+const RUBY_MIXIN_KEYWORDS = new Set(["include", "extend", "prepend"] as const);
 
 /**
  * `include Mod`/`extend Mod`/`prepend Mod` (bare, no receiver) inside a
  * class/module body — every named `constant` argument becomes a mixin
- * target. Returns [] for anything else (an ordinary call, or `foo.include
+ * target. Returns null for anything else (an ordinary call, or `foo.include
  * Bar` with an explicit receiver, which isn't mixin composition).
+ *
+ * The keyword travels with the targets because the three are one relation in the
+ * graph and three different things in Ruby's constant lookup — see
+ * `RawEdge.rubyHeritage`.
  */
-function rubyMixinTargets(node: Parser.SyntaxNode): string[] {
+function rubyMixinTargets(
+  node: Parser.SyntaxNode,
+): { keyword: "include" | "extend" | "prepend"; targets: string[] } | null {
   const methodNode = node.childForFieldName("method");
-  if (methodNode?.type !== "identifier" || !RUBY_MIXIN_KEYWORDS.has(methodNode.text)) return [];
-  if (node.childForFieldName("receiver")) return [];
+  if (methodNode?.type !== "identifier") return null;
+  const keyword = methodNode.text as "include" | "extend" | "prepend";
+  if (!RUBY_MIXIN_KEYWORDS.has(keyword)) return null;
+  if (node.childForFieldName("receiver")) return null;
   const args = node.childForFieldName("arguments");
   // `include ActiveSupport::Concern` is as common as `include Comparable`, and M0
   // matched only the bare form. Anything whose head is not a constant
   // (`include Dry::Monads[:result]`, an index call) still yields nothing.
-  return (args?.namedChildren ?? [])
+  const targets = (args?.namedChildren ?? [])
     .map((c) => rubyConstPath(c))
     .filter((p): p is string => p !== null);
+  return targets.length > 0 ? { keyword, targets } : null;
 }
 
 interface RubySynthesizedMethod {
@@ -2784,7 +2835,10 @@ function heritageEdges(node: Parser.SyntaxNode, classId: string, ctx: WalkCtx): 
     // bare-name match that could never have matched `D::E` in the first place.
     const path = superclass?.namedChildren[0] ? rubyConstPath(superclass.namedChildren[0]) : null;
     if (path !== null) {
-      edges.push({ source: classId, relation: "extends", name: path, file: ctx.rel, nesting: [...ctx.rubyNesting] });
+      edges.push({
+        source: classId, relation: "extends", name: path, file: ctx.rel,
+        nesting: [...ctx.rubyNesting], rubyHeritage: "superclass",
+      });
     }
     return edges;
   }

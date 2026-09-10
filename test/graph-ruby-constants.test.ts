@@ -408,3 +408,178 @@ end
     assert.deepEqual(refs(graph, "a.rb#Checkout.run"), []);
   });
 });
+
+/*
+ * Ancestor ORDER, and the two places Ruby's own order is not the emission order.
+ *
+ * Every expectation below was taken from `ruby -e`, not from the language spec:
+ * the three cases each resolved to a different constant than this code produced
+ * before, and all three carried `confidence: "extracted"` while doing it.
+ */
+
+test("ruby constants: an include beats the superclass, the way Ruby orders ancestors", async () => {
+  // `Child.ancestors` is `[Child, Mix, Base]` — a module included in the class sits
+  // ABOVE the superclass. Resolving to `Base::Inner` here is a wrong edge, not a
+  // missing one, and heritage edges arrive superclass-first because that is the
+  // order the syntax puts them in, not the order Ruby searches them in.
+  await withGraph(
+    {
+      "base.rb": `class Base\n  class Inner; end\nend\n`,
+      "mix.rb": `module Mix\n  class Inner; end\nend\n`,
+      "child.rb": `class Child < Base\n  include Mix\n  def go\n    Inner.new\n  end\nend\n`,
+    },
+    (graph) => {
+      assert.deepEqual(refs(graph, "child.rb#Child.go"), ["mix.rb#Mix.Inner"]);
+    },
+  );
+});
+
+test("ruby constants: the LAST include wins, because each one inserts nearest", async () => {
+  // `include A; include B` gives `[C, B, A]`. Declaration order and search order
+  // are exact opposites, so taking them as emitted is wrong every single time two
+  // included modules define the same name.
+  await withGraph(
+    {
+      "a.rb": `module A\n  class Inner; end\nend\n`,
+      "b.rb": `module B\n  class Inner; end\nend\n`,
+      "c.rb": `class C\n  include A\n  include B\n  def go\n    Inner.new\n  end\nend\n`,
+    },
+    (graph) => {
+      assert.deepEqual(refs(graph, "c.rb#C.go"), ["b.rb#B.Inner"]);
+    },
+  );
+});
+
+test("ruby constants: a prepended module beats the superclass", async () => {
+  // `prepend` lands in front of the class itself: `[P, C, Base]`.
+  await withGraph(
+    {
+      "p.rb": `module P\n  class Inner; end\nend\n`,
+      "base.rb": `class Base\n  class Inner; end\nend\n`,
+      "c.rb": `class C < Base\n  prepend P\n  def go\n    Inner.new\n  end\nend\n`,
+    },
+    (graph) => {
+      assert.deepEqual(refs(graph, "c.rb#C.go"), ["p.rb#P.Inner"]);
+    },
+  );
+});
+
+test("ruby constants: `extend` contributes nothing to constant lookup", async () => {
+  // The one that reads wrong until you say it out loud: `extend` composes the
+  // SINGLETON class, and step 2 of constant lookup walks `cref.ancestors`, which
+  // `extend` never enters. Ruby answers `::Inner` here — from an instance method
+  // and from a class method alike, because constant lookup is lexical and does not
+  // care what `self` is.
+  await withGraph(
+    {
+      "mix.rb": `module Mix\n  class Inner; end\nend\n`,
+      "top.rb": `class Inner; end\n`,
+      "c.rb": `class C\n  extend Mix\n  def go\n    Inner.new\n  end\nend\n`,
+    },
+    (graph) => {
+      assert.deepEqual(refs(graph, "c.rb#C.go"), ["top.rb#Inner"]);
+    },
+  );
+});
+
+test("ruby constants: a qualified reference commits to the namespace its head named", async () => {
+  // Ruby resolves `B` in `B::X` first, to `A::B`, and then looks for `X` inside it
+  // — finding `Base::X` by inheritance. It never reconsiders the top-level `B`.
+  // Trying the whole dotted path at each nesting level instead looks like a
+  // harmless shortcut and answers `BTop::X`, which this program never touches.
+  await withGraph(
+    {
+      "base.rb": `class Base\n  class X; end\nend\n`,
+      "ab.rb": `module A\n  class B < Base; end\nend\n`,
+      "btop.rb": `module B\n  class X; end\nend\n`,
+      "use.rb": `module A\n  class Caller\n    def go\n      B::X.new\n    end\n  end\nend\n`,
+    },
+    (graph) => {
+      assert.deepEqual(refs(graph, "use.rb#A.Caller.go"), ["base.rb#Base.X"]);
+    },
+  );
+});
+
+test("ruby constants: a compact-form namespace still resolves through the flat scan", async () => {
+  // The recall half of the commit rule. `class Billing::Invoice` mints no `Billing`
+  // node, so there is no head to commit to and the flat scan is the only evidence
+  // there is. Losing this to fix the case above would have traded one wrong answer
+  // for a whole class of missing ones.
+  await withGraph(
+    {
+      "lib.rb": `class Billing::Invoice; end\n`,
+      "use.rb": `class Checkout\n  def run\n    Billing::Invoice.new\n  end\nend\n`,
+    },
+    (graph) => {
+      assert.deepEqual(refs(graph, "use.rb#Checkout.run"), ["lib.rb#Billing.Invoice"]);
+    },
+  );
+});
+
+test("ruby constants: a constant ASSIGNMENT shadows an outer class of that name", async () => {
+  // `X = 123` inside `module A` is `A::X`, and Ruby's search stops there. There is
+  // no node to point at — the value is an integer — so the right answer is no edge.
+  // Walking past it to an unrelated top-level `class X` answers a question the
+  // source never asked.
+  await withGraph(
+    {
+      "a.rb": `module A\n  X = 123\n  class Caller\n    def go\n      X\n    end\n  end\nend\n`,
+      "x.rb": `class X; end\n`,
+    },
+    (graph) => {
+      assert.deepEqual(refs(graph, "a.rb#A.Caller.go"), []);
+    },
+  );
+});
+
+test("ruby constants: a shadow one level out does not suppress a nearer real match", async () => {
+  // The guard on the guard: shadowing must stop the search exactly where Ruby's
+  // would stop, never earlier. `A::B::Thing` is found before `A::Thing = 1` is
+  // ever consulted.
+  await withGraph(
+    {
+      "a.rb":
+        `module A\n  Thing = 1\n  module B\n    class Thing; end\n    class Caller\n` +
+        `      def go\n        Thing.new\n      end\n    end\n  end\nend\n`,
+    },
+    (graph) => {
+      assert.deepEqual(refs(graph, "a.rb#A.B.Caller.go"), ["a.rb#A.B.Thing"]);
+    },
+  );
+});
+
+test("ruby constants: a namespace reopened by many files is still one namespace", async () => {
+  // The head of a qualified reference only has to EXIST; it does not have to be
+  // pinned to one node. Every controller in a Rails app reopens `module App`, and
+  // treating twenty reopenings as an ambiguous choice made `App::BaseController`
+  // unresolvable — the tail was never reached at all. Only the terminal segment,
+  // the one an edge actually points at, has to be unambiguous.
+  await withGraph(
+    {
+      "a.rb": `module App\n  class BaseController; end\nend\n`,
+      "b.rb": `module App\n  class Widgets; end\nend\n`,
+      "c.rb": `module App\n  class Gadgets; end\nend\n`,
+      "d.rb": `class Thing\n  def go\n    App::BaseController.new\n  end\nend\n`,
+    },
+    (graph) => {
+      assert.deepEqual(refs(graph, "d.rb#Thing.go"), ["a.rb#App.BaseController"]);
+    },
+  );
+});
+
+test("ruby constants: a qualified tail resolves through the head's superclass", async () => {
+  // `Schemas::BaseEvent::ValidationError` where `ValidationError` is defined on
+  // `BaseSchema`, which `BaseEvent` inherits from. Ruby finds it; trying the whole
+  // dotted path at each nesting level never could, because no node is named
+  // `Schemas::BaseEvent::ValidationError` anywhere.
+  await withGraph(
+    {
+      "base.rb": `module Schemas\n  class BaseSchema\n    class ValidationError < StandardError; end\n  end\nend\n`,
+      "event.rb": `module Schemas\n  class BaseEvent < BaseSchema; end\nend\n`,
+      "t.rb": `class T\n  def go\n    raise Schemas::BaseEvent::ValidationError\n  end\nend\n`,
+    },
+    (graph) => {
+      assert.deepEqual(refs(graph, "t.rb#T.go"), ["base.rb#Schemas.BaseSchema.ValidationError"]);
+    },
+  );
+});
