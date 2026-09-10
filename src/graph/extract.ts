@@ -152,6 +152,13 @@ export interface RawEdge {
    * no such member — and ONLY then, so a name defined as both a member and a
    * free function yields the member edge alone, exactly as Swift dispatches it. */
   implicitSelf?: boolean;
+  /** Ruby only: `Module.nesting` at the reference site, innermost first
+   * (`["A::B::C", "A::B", "A"]`). Present on every Ruby `references` edge and on
+   * Ruby heritage edges (superclass and `include`/`extend`/`prepend`), which is
+   * what routes them through the constant resolver rather than the bare-name
+   * ladder. Its presence — not the language of the file — is the switch, so a
+   * graph built before this field resolves exactly as it did before. */
+  nesting?: string[];
 }
 
 export interface ExtractResult {
@@ -361,6 +368,7 @@ const FUNCTION_VALUE_TYPES = new Set([
 
 const EMPTY_SET: ReadonlySet<string> = new Set();
 const EMPTY_MAP: ReadonlyMap<string, "protected" | "private"> = new Map();
+const EMPTY_NESTING: readonly string[] = [];
 
 const parser = new Parser();
 const GRAMMARS: Record<Language, unknown> = {
@@ -428,6 +436,13 @@ export interface WalkCtx {
   // whenever a new class/module body is entered, same trigger as
   // rubyVisibility.
   rubyPostHoc: ReadonlyMap<string, "protected" | "private">;
+  // Ruby (M1): `Module.nesting` at this point in the walk, innermost first —
+  // ["A::B::C", "A::B", "A"] inside `module A; module B; class C`. This is the
+  // chain Ruby itself searches for a bare constant, and it is NOT the same as
+  // `scope`: the compact form `class A::B::C` pushes ONE entry, not three, so
+  // its body cannot see `A::B` or `A`. Both spellings occur in real Rails code
+  // and they are not interchangeable — see rubyCref().
+  rubyNesting: readonly string[];
 }
 
 /** A definition we're about to emit, normalized across the shapes we handle. */
@@ -504,6 +519,7 @@ export function extractFile(rel: string, source: string, lang: Language): Extrac
     rSuperClass: null,
     rubyVisibility: "public",
     rubyPostHoc: EMPTY_MAP,
+    rubyNesting: EMPTY_NESTING,
   };
   // Every id minted this file, seeded with the file node's own id (`rel`) so a
   // top-level definition can never collide with it. Threaded as its own
@@ -764,6 +780,10 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
         ctx.lang === "ruby" && (desc.kind === "class" || desc.kind === "module")
           ? rubyPostHocVisibility(node)
           : ctx.rubyPostHoc,
+      rubyNesting:
+        ctx.lang === "ruby" && (desc.kind === "class" || desc.kind === "module")
+          ? [rubyCref(ctx.rubyNesting[0], idPart), ...ctx.rubyNesting]
+          : ctx.rubyNesting,
     };
     walkNamedChildren(node.namedChildren, childCtx, out, edges, minted);
     return;
@@ -839,7 +859,13 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
     const rubyMixins = ctx.lang === "ruby" && ctx.enclosingClass !== null ? rubyMixinTargets(node) : [];
     if (rubyMixins.length > 0) {
       for (const target of rubyMixins) {
-        edges.push({ source: ctx.parentId, relation: "extends", name: target, file: ctx.rel });
+        edges.push({
+          source: ctx.parentId,
+          relation: "extends",
+          name: target,
+          file: ctx.rel,
+          nesting: [...ctx.rubyNesting],
+        });
       }
       return;
     }
@@ -929,6 +955,33 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
       file: ctx.rel,
       kinds: ["function", "method"],
     });
+  } else if (
+    ctx.lang === "ruby" &&
+    (node.type === "constant" || node.type === "scope_resolution") &&
+    rubyConstPath(node) !== null // `obj::CONST` falls through: its head may hold calls
+  ) {
+    // M1: a constant reference, carrying the nesting chain it must be resolved
+    // against. `raise CrossTenantAccessError` produced NOTHING under M0 — nine
+    // raise sites in filewerk-rails pointing at a class the graph already had a
+    // node for — because Ruby has no import statement, so there was no specifier
+    // to key off and nothing else emitted a `references` edge for Ruby at all.
+    //
+    // A qualified path emits ONE edge, naming its terminal. Descending would also
+    // emit the head (`TenantSecurity` for `TenantSecurity::CrossTenantAccessError`),
+    // and on a real app that lands squarely on the module a `callers` query is
+    // most often asked about — a second, wrong answer bolted onto a right one.
+    // Hence the `return`: a scope_resolution's parts are not separate references.
+    const path = isRubyConstantDefinition(node) ? null : rubyConstPath(node);
+    if (path !== null) {
+      edges.push({
+        source: ctx.parentId,
+        relation: "references",
+        name: path,
+        file: ctx.rel,
+        nesting: [...ctx.rubyNesting],
+      });
+    }
+    return;
   } else if (ctx.lang === "php" && node.type === "use_declaration") {
     // Trait composition inside a class body (`use HasFactory, Notifiable;`).
     // Modelled as `implements`: like an interface, a trait is a contract of
@@ -1838,15 +1891,27 @@ function rRoxygenExported(node: Parser.SyntaxNode): boolean | null {
 function describeRuby(node: Parser.SyntaxNode, ctx: WalkCtx): DefDescriptor | null {
   if (node.type === "class" || node.type === "module") {
     const nameNode = node.childForFieldName("name");
-    // `class A::B` (compact nesting) names itself via a `scope_resolution`
-    // node, not a plain `constant` — deliberately unhandled (Phase 1 stays to
-    // the common `class Foo` / `module Foo` shape; see spec's "erring toward
-    // false negatives" precedent).
-    if (nameNode?.type !== "constant") return null;
+    if (!nameNode) return null;
+    // `class A::B::C` (the compact form) names itself via a `scope_resolution`
+    // rather than a plain `constant`. M0 dropped it, and on a real Rails app
+    // that cost a whole class of answers: all 12 filewerk controllers written
+    // `class Admin::UsersController < ...` had NO class node, so their
+    // superclass and `include` edges were missing outright and their actions
+    // landed as file-scoped `index`/`show`/`destroy` nodes — 11 definitions
+    // sharing one bare name, which no query can tell apart.
+    //
+    // `name` stays the terminal constant, because that is what call resolution
+    // matches; `idName` carries the dotted path so the id is IDENTICAL to what
+    // the nested spelling `module App; class InvitationsController` produces.
+    // Two spellings of one class must not describe it under two names.
+    const path = rubyConstPath(nameNode);
+    if (path === null) return null;
+    const segs = path.replace(/^::/, "").split("::");
     const body = node.childForFieldName("body");
     const hashNode = body ?? node;
     return {
-      name: nameNode.text,
+      name: segs[segs.length - 1],
+      ...(segs.length > 1 ? { idName: segs.join(".") } : {}),
       kind: node.type === "class" ? "class" : "module",
       headerEnd: (body ?? node).startIndex,
       hashNode,
@@ -1883,6 +1948,70 @@ function describeRuby(node: Parser.SyntaxNode, ctx: WalkCtx): DefDescriptor | nu
     };
   }
   return null;
+}
+
+/**
+ * A constant reference rendered the way Ruby writes it: `Runner`, `A::B::Runner`,
+ * or `::Runner` for the top-level escape. Null when any part of the path is not a
+ * constant — `obj::CONST` and `foo.bar::Baz` are legal Ruby but their head is a
+ * runtime value, so nothing static can say what they name.
+ *
+ * The leading `::` is preserved rather than stripped: it is the programmer saying
+ * "not the one you would have found," and `resolve.ts` reads it as an instruction
+ * to skip the nesting chain entirely. Dropping it would silently turn a
+ * deliberate escape into an ordinary shadowed lookup.
+ */
+function rubyConstPath(node: Parser.SyntaxNode): string | null {
+  if (node.type === "constant") return node.text;
+  if (node.type !== "scope_resolution") return null;
+  const name = node.childForFieldName("name");
+  if (name?.type !== "constant") return null;
+  const scope = node.childForFieldName("scope");
+  if (!scope) return `::${name.text}`; // `::Foo` — no scope field is the marker
+  const head = rubyConstPath(scope);
+  return head === null ? null : `${head}::${name.text}`;
+}
+
+/**
+ * The cref a class/module body opens, appended to the enclosing one.
+ *
+ * `idPart` is dotted (`App.InvitationsController` for the compact form), which is
+ * exactly the property that makes this correct: the compact form contributes its
+ * WHOLE path as one nesting entry, so `class A::B::C` yields `[A::B::C]` while the
+ * nested spelling yields `[A::B::C, A::B, A]`. That difference is Ruby's, not an
+ * approximation of it, and it is why the two forms genuinely resolve differently.
+ *
+ * One known divergence: `module M; class ::Foo` opens top-level `::Foo`, so Ruby's
+ * nesting is `[Foo]` where this produces `M::Foo`. M0 emitted no node at all for
+ * that shape, so nothing regresses; it is left alone because the id would then
+ * disagree with `ctx.scope`, which is built from the same lexical chain.
+ */
+function rubyCref(parent: string | undefined, idPart: string): string {
+  const own = idPart.split(".").join("::");
+  return parent ? `${parent}::${own}` : own;
+}
+
+/**
+ * Is this constant node a *definition* rather than a reference?
+ *
+ * Three shapes, and all three would otherwise become an edge pointing at the very
+ * thing being declared:
+ *  - `class Foo` / `module Foo` — the walk descends into a class node's own name.
+ *  - `FOO = 1` / `A::B = 1` — the assignment's left-hand side.
+ *  - `class Foo < Bar` — the superclass, already carried by an `extends` edge;
+ *    emitting a `references` edge too would double-count every heritage line.
+ *
+ * Mixin arguments (`include Mod`) need no case here: the mixin branch in walk()
+ * consumes the call and returns without descending into its argument list.
+ */
+function isRubyConstantDefinition(node: Parser.SyntaxNode): boolean {
+  const parent = node.parent;
+  if (!parent) return false;
+  if (parent.type === "superclass") return true;
+  return (
+    sameSyntaxNode(parent.childForFieldName("name"), node) ||
+    sameSyntaxNode(parent.childForFieldName("left"), node)
+  );
 }
 
 /**
@@ -2010,7 +2139,12 @@ function rubyMixinTargets(node: Parser.SyntaxNode): string[] {
   if (methodNode?.type !== "identifier" || !RUBY_MIXIN_KEYWORDS.has(methodNode.text)) return [];
   if (node.childForFieldName("receiver")) return [];
   const args = node.childForFieldName("arguments");
-  return (args?.namedChildren ?? []).filter((c) => c.type === "constant").map((c) => c.text);
+  // `include ActiveSupport::Concern` is as common as `include Comparable`, and M0
+  // matched only the bare form. Anything whose head is not a constant
+  // (`include Dry::Monads[:result]`, an index call) still yields nothing.
+  return (args?.namedChildren ?? [])
+    .map((c) => rubyConstPath(c))
+    .filter((p): p is string => p !== null);
 }
 
 interface RubySynthesizedMethod {
@@ -2644,9 +2778,13 @@ function heritageEdges(node: Parser.SyntaxNode, classId: string, ctx: WalkCtx): 
   }
   if (ctx.lang === "ruby") {
     const superclass = node.childForFieldName("superclass");
-    const constant = superclass?.namedChildren[0];
-    if (constant?.type === "constant") {
-      edges.push({ source: classId, relation: "extends", name: constant.text, file: ctx.rel });
+    // `class C < D::E` — M0 required a plain `constant` here, so every namespaced
+    // parent emitted nothing at all. The name is kept as written and carries the
+    // nesting chain, so resolve.ts can run Ruby's own lookup on it instead of a
+    // bare-name match that could never have matched `D::E` in the first place.
+    const path = superclass?.namedChildren[0] ? rubyConstPath(superclass.namedChildren[0]) : null;
+    if (path !== null) {
+      edges.push({ source: classId, relation: "extends", name: path, file: ctx.rel, nesting: [...ctx.rubyNesting] });
     }
     return edges;
   }

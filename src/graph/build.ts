@@ -39,6 +39,7 @@ import { readGraph, writeGraph, wiringPath } from "./write.js";
 import { writeCards, writeIndex, writeCovers, type CardStats } from "./cards.js";
 import { writeAskIndex } from "../ask/index-file.js";
 import { discoverScopes, scopeOf } from "./scopes.js";
+import { discoverZeitwerk } from "./zeitwerk.js";
 import type { GraphV1, Kind, NodeV1, Relation, ScopeV1 } from "./types.js";
 import type { CruxSummarizer } from "../ai/crux.js";
 
@@ -288,7 +289,13 @@ export async function buildGraph(
     files: entries,
   });
 
-  const edges = resolveEdges(nodes, rawEdges, { goModules: readGoModules(root, repoFiles) });
+  const edges = resolveEdges(nodes, rawEdges, {
+    goModules: readGoModules(root, repoFiles),
+    // The same single enumeration every other repo-wide pass takes, for the same
+    // reason: an ignored or vendored `app/` tree must not contribute autoload
+    // roots that extraction itself never saw.
+    zeitwerk: discoverZeitwerk(root, repoFiles),
+  });
 
   // Guard 5 (minimum-substance): node counts aren't known until nodes are
   // assembled, so the merge-tiny-scopes-into-root guard runs here.

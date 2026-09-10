@@ -17,6 +17,7 @@ import { toPosixPath } from "../util/paths.js";
 import type { EdgeV1, Kind, NodeV1, Relation } from "./types.js";
 import { languageOf, type RawEdge } from "./extract.js";
 import { genericLangOf } from "./generic.js";
+import { isAutoloadHome, type ZeitwerkMap } from "./zeitwerk.js";
 
 const IMPORT_EXTS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".py"];
 /** C/C++ source + header extensions, for resolving `#include` targets. */
@@ -96,6 +97,12 @@ export interface ResolveOptions {
    * (`example.com/app/pkg/util`) to the in-repo directory they name, relative to the
    * owning module's `go.mod` location. Empty/absent → Go imports stay external strings. */
   goModules?: GoModule[];
+  /** The Rails autoload map, or null/absent when the repo is not a Rails app. Used
+   * ONLY to break a tie between several files defining one constant — never as a
+   * first resort, and never to invent a target Ruby's own lexical lookup did not
+   * already find. A plain Ruby project therefore resolves constants identically
+   * with or without it. */
+  zeitwerk?: ZeitwerkMap | null;
 }
 
 export function resolveEdges(
@@ -128,6 +135,11 @@ export function resolveEdges(
   // node ids. A `use App\Models\User` names a PSR-4 class whose file mirrors the namespace
   // tail under some (unknown) source root, so the suffix is the portable key.
   const phpFilesBySuffix = new Map<string, string[]>();
+  // Ruby constant resolution: fully-qualified constant → the class/module nodes
+  // defining it. Ruby-only by construction, which is what keeps a Ruby `Invoice`
+  // from ever reaching a TypeScript class of the same name — the guard is in the
+  // index, not in a filter the caller has to remember to apply.
+  const rubyFqn = new Map<string, NodeV1[]>();
   const hasGoModules = !!opts.goModules?.length;
   for (const n of nodes) {
     if (n.kind === "file") {
@@ -165,6 +177,28 @@ export function resolveEdges(
       const owner = n.owner ?? ownerFromMethodId(n.id);
       if (owner) push(ownerMethod, `${owner}.${n.name}`, n);
     }
+    if ((n.kind === "class" || n.kind === "module") && RB_EXT.test(n.path)) {
+      const fqn = rubyFqnOf(n.id);
+      if (fqn) push(rubyFqn, fqn, n);
+    }
+  }
+
+  // Ruby ancestors, FQN-keyed, for step 2 of the constant lookup. Built from the
+  // heritage edges themselves in a pre-pass, because the answer is needed BEFORE
+  // the main loop resolves them — a constant may only be visible through the very
+  // superclass whose own name is a constant reference. The pre-pass runs the same
+  // lookup with the ancestor step disabled, which terminates by construction and
+  // costs one extra pass over the (small) heritage subset.
+  const zeitwerk = opts.zeitwerk ?? null;
+  const rubyAncestors = new Map<string, string[]>();
+  const NO_ANCESTORS = new Map<string, string[]>();
+  for (const e of rawEdges) {
+    if (e.relation !== "extends" || !e.name || !e.nesting) continue;
+    const ownFqn = rubyFqnOf(e.source);
+    if (!ownFqn) continue;
+    const hit = resolveRubyConstant(e.name, e.nesting, e.file, rubyFqn, NO_ANCESTORS, zeitwerk, false);
+    const parentFqn = hit ? rubyFqnOf(hit.id) : null;
+    if (parentFqn) push(rubyAncestors, ownFqn, parentFqn);
   }
 
   // classParents: class/interface name → its declared base-class names, from raw
@@ -234,7 +268,16 @@ export function resolveEdges(
           : e.file.endsWith(".rb")
             ? ["class", "interface", "module"]
             : ["class", "interface"];
-      const hit = resolveName(e.name!, e.file, kinds, perFileName, globalName);
+      // Ruby heritage goes through the constant resolver first: `class C < D::E`
+      // and `include Auth::Helper` name a constant path, which the bare-name
+      // ladder below could never match, and even a bare `include TenantSecurity`
+      // means the one Ruby's nesting picks rather than the one that happens to be
+      // globally unique. It declines rather than guesses, and then M0's own
+      // resolution runs unchanged — so nothing this cannot answer regresses.
+      const constHit = e.nesting
+        ? resolveRubyConstant(e.name!, e.nesting, e.file, rubyFqn, rubyAncestors, zeitwerk, true)
+        : null;
+      const hit = constHit ?? resolveName(e.name!, e.file, kinds, perFileName, globalName);
       // an unresolved base is usually an external/imported type — keep the name.
       add(e.source, hit?.id ?? e.name!, e.relation, hit?.confidence ?? "inferred");
     } else if (e.relation === "references" && e.name) {
@@ -248,6 +291,17 @@ export function resolveEdges(
         if (!byId.has(targetFile)) continue; // external or unresolved module
         const candidates = perFileName.get(targetFile)?.get(e.name) ?? [];
         if (candidates.length === 1) add(e.source, candidates[0].id, "references", "extracted");
+      } else if (e.nesting) {
+        // Ruby (M1). The presence of a nesting chain is the switch, so this path
+        // is provably unreachable for every other language and for any graph built
+        // before the field existed. Unresolved constants — gems, stdlib, anything
+        // outside the repo, which is most of what a Rails file names — drop
+        // entirely rather than keeping the bare name the way heritage does: a
+        // `references` target that is not a node id would put `ActiveRecord::Base`
+        // into the graph as a phantom, and `graph-quality --strict` counts
+        // dangling endpoints for exactly that reason.
+        const hit = resolveRubyConstant(e.name, e.nesting, e.file, rubyFqn, rubyAncestors, zeitwerk, true);
+        if (hit && hit.id !== e.source) add(e.source, hit.id, "references", hit.confidence);
       } else if (e.file.endsWith(".php") && byId.get(e.source)?.origin === "ast") {
         // PHP attribute without a `use` import (same-file or globally unique class).
         const refKinds: Kind[] = ["class", "interface", "trait", "enum"];
@@ -344,6 +398,127 @@ export function resolveEdges(
       }
       if (hit) add(e.source, hit.id, "calls", hit.confidence); // drop unresolved calls (too noisy)
     }
+  }
+  return out;
+}
+
+/** Ruby source, for the constant index. `.rbi`/`.rbs` are signature files with no
+ * bodies and no autoload home, so they are deliberately not constants' definitions. */
+const RB_EXT = /\.rb$/i;
+
+/** How far the ancestor step walks. Same bound and the same reason as
+ * `resolveTypedMember`: a deep chain is a sign of a modelling problem, not of a
+ * constant that needs finding, and an unbounded walk on a Rails app with dozens of
+ * concerns per model is a real cost. */
+const RUBY_ANCESTOR_DEPTH = 3;
+
+/**
+ * The fully-qualified Ruby constant a class/module node defines, read off its id.
+ *
+ * `app/models/current.rb#TenantSecurity.CrossTenantAccessError` →
+ * `TenantSecurity::CrossTenantAccessError`. The dedup ordinal `mintId` appends is
+ * stripped, because `class Foo` reopened later in the same file is ONE constant
+ * with two nodes, not two constants — see `pickRubyConstant`, which relies on that.
+ */
+function rubyFqnOf(id: string): string | null {
+  const hash = id.indexOf("#");
+  if (hash === -1) return null; // a file node defines no constant of its own
+  return id
+    .slice(hash + 1)
+    .split(".")
+    .map((seg) => seg.replace(/~\d+$/, ""))
+    .join("::");
+}
+
+/**
+ * Choose among the nodes defining one fully-qualified constant.
+ *
+ * Returns `"ambiguous"` rather than a guess when several files define it and
+ * nothing can adjudicate — and the caller must then STOP rather than try a
+ * shallower prefix, because Ruby would have found the constant at this level too.
+ * Continuing would answer a different question than the one the source asks.
+ */
+function pickRubyConstant(
+  candidates: NodeV1[] | undefined,
+  file: string,
+  fqn: string,
+  zeitwerk: ZeitwerkMap | null,
+): { id: string; confidence: EdgeV1["confidence"] } | "ambiguous" | null {
+  if (!candidates || candidates.length === 0) return null;
+  if (candidates.length === 1) {
+    const c = candidates[0];
+    return { id: c.id, confidence: c.path === file ? "extracted" : "inferred" };
+  }
+  // Several nodes in THIS file are one reopened constant, not a choice — unlike
+  // `resolveName`'s same-file branch, which requires uniqueness because there a
+  // second node means a genuinely different symbol (`Alpha.Builder` vs
+  // `Beta.Builder`). Here the ids agree on the whole constant path, so document
+  // order is a deterministic pointer at a real part of the same thing.
+  const sameFile = candidates.filter((c) => c.path === file);
+  if (sameFile.length > 0) return { id: sameFile[0].id, confidence: "extracted" };
+  // Different files: only the autoload map can say which one Ruby would load.
+  if (zeitwerk) {
+    const homed = candidates.filter((c) => isAutoloadHome(zeitwerk, c.path, fqn));
+    if (homed.length === 1) return { id: homed[0].id, confidence: "inferred" };
+  }
+  return "ambiguous";
+}
+
+/**
+ * Resolve a Ruby constant reference the way Ruby resolves it.
+ *
+ *   1. `Module.nesting`, innermost first.
+ *   2. The innermost cref's ancestors — superclass chain and included modules.
+ *   3. Top level.
+ *
+ * `::X` skips straight to step 3, which is what the programmer wrote it for.
+ *
+ * One deliberate simplification: Ruby resolves the HEAD of `A::B::C` at each
+ * level and then walks down from there, raising NameError if the tail is missing.
+ * This tries the whole path at each level instead, so where Ruby would stop and
+ * fail, this continues to the next prefix. The two differ only on code that
+ * raises at runtime, and the graph's job is to describe code that works.
+ */
+function resolveRubyConstant(
+  ref: string,
+  nesting: readonly string[],
+  file: string,
+  fqnIndex: Map<string, NodeV1[]>,
+  ancestors: Map<string, string[]>,
+  zeitwerk: ZeitwerkMap | null,
+  useAncestors: boolean,
+): { id: string; confidence: EdgeV1["confidence"] } | null {
+  const absolute = ref.startsWith("::");
+  const bare = absolute ? ref.slice(2) : ref;
+  const prefixes = absolute
+    ? [""]
+    : [...nesting, ...(useAncestors ? ancestorPrefixes(nesting[0], ancestors) : []), ""];
+  for (const prefix of prefixes) {
+    const fqn = prefix ? `${prefix}::${bare}` : bare;
+    const hit = pickRubyConstant(fqnIndex.get(fqn), file, fqn, zeitwerk);
+    if (hit === "ambiguous") return null; // found here, but undecidable — never guess past it
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/** The innermost cref's ancestors, nearest first, bounded and cycle-guarded. */
+function ancestorPrefixes(cref: string | undefined, ancestors: Map<string, string[]>): string[] {
+  if (!cref) return [];
+  const out: string[] = [];
+  const seen = new Set<string>([cref]);
+  let frontier = [cref];
+  for (let depth = 0; depth < RUBY_ANCESTOR_DEPTH && frontier.length; depth++) {
+    const next: string[] = [];
+    for (const c of frontier) {
+      for (const parent of ancestors.get(c) ?? []) {
+        if (seen.has(parent)) continue;
+        seen.add(parent);
+        out.push(parent);
+        next.push(parent);
+      }
+    }
+    frontier = next;
   }
   return out;
 }
