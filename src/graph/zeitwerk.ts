@@ -70,12 +70,25 @@ const ACRONYM = /\binflect\.acronym\s+['"]([^'"]+)['"]/g;
  * contribute roots (mirrors `readGoModules`, which takes the same list for the
  * same reason).
  */
+/**
+ * The files that decide whether this repo is a Rails app AT ALL, and which are not
+ * source files, so nothing else tracks them.
+ *
+ * `config/application.rb` and `config/initializers/inflections.rb` are Ruby and are
+ * already in the fingerprint by virtue of being parsed. A Gemfile is not, and it is
+ * half the detection: editing it from `gem "rails"` to something else changes every
+ * Ruby constant edge in the graph while leaving the freshness probe perfectly clean,
+ * so queries kept answering from a Zeitwerk-resolved graph that an explicit rebuild
+ * would have thrown away. See `writeFingerprint`.
+ */
+export const RAILS_WITNESS_FILES = ["Gemfile", "gems.rb"] as const;
+
 export function discoverZeitwerk(root: string, repoFiles: string[]): ZeitwerkMap | null {
   const rels = repoFiles.map((f) => relPosix(root, f));
   const relSet = new Set(rels);
   if (!relSet.has("config/application.rb")) return null;
 
-  const gemfile = ["Gemfile", "gems.rb"].find((g) => relSet.has(g));
+  const gemfile = RAILS_WITNESS_FILES.find((g) => relSet.has(g));
   if (!gemfile) return null;
   if (!GEMFILE_RAILS.test(read(posix.join(root, gemfile)) ?? "")) return null;
 
@@ -198,20 +211,52 @@ export function camelize(segment: string, acronyms: ReadonlyMap<string, string>)
  * that resolves to nothing, and the caller emits no edge. It can lose an edge; it
  * cannot invent one.
  */
+/** ActiveSupport's `uncountable` list, verbatim. Matched against the LAST word of a
+ * snake_case name the way ActiveSupport matches it, so `sales_fish` is uncountable
+ * and `line_items` is not. */
 const UNCOUNTABLE = new Set([
-  "equipment", "information", "rice", "money", "species", "series", "fish", "sheep", "news", "data",
+  "equipment", "fish", "information", "jeans", "money", "police", "rice", "series",
+  "sheep", "species",
 ]);
+const UNCOUNTABLE_RE = new RegExp(`\\b(?:${[...UNCOUNTABLE].join("|")})$`, "i");
 
-const IRREGULAR = new Map([
-  ["people", "person"], ["men", "man"], ["women", "woman"], ["children", "child"],
-  ["feet", "foot"], ["teeth", "tooth"], ["geese", "goose"], ["mice", "mouse"], ["oxen", "ox"],
-]);
-
+/**
+ * ActiveSupport's singular rules, in ActiveSupport's own evaluation order.
+ *
+ * Read off a running `ActiveSupport::Inflector.inflections.singulars` rather than
+ * remembered, because the differences are not the ones intuition suggests. Three
+ * that the previous hand-written table got wrong:
+ *
+ *   - `databases` needs its own rule, or `(x|ch|ss|sh)es$` never fires and the
+ *     generic `s$` leaves `databasis` by way of `(cris|test)(is|es)$`.
+ *   - the irregulars are RULES, not a word list, so `salespeople` singularizes to
+ *     `salesperson`; an exact-match map only ever caught the bare `people`.
+ *   - `moves` is irregular in ActiveSupport; the generic `([^f])ves$` rule turns it
+ *     into `mofe`.
+ *
+ * Each irregular is a PAIR: the plural rule and an identity rule for the singular,
+ * so an already-singular word stops rather than falling through to a generic rule.
+ * `feet`, `teeth` and `geese` are absent on purpose — ActiveSupport does not
+ * singularize them either, and this has to predict Rails, not English.
+ */
 const SINGULAR_RULES: ReadonlyArray<readonly [RegExp, string]> = [
+  [/(z)ombies$/i, "$1ombie"],
+  [/(z)ombie$/i, "$1ombie"],
+  [/(m)oves$/i, "$1ove"],
+  [/(m)ove$/i, "$1ove"],
+  [/(s)exes$/i, "$1ex"],
+  [/(s)ex$/i, "$1ex"],
+  [/(c)hildren$/i, "$1hild"],
+  [/(c)hild$/i, "$1hild"],
+  [/(m)en$/i, "$1an"],
+  [/(m)an$/i, "$1an"],
+  [/(p)eople$/i, "$1erson"],
+  [/(p)erson$/i, "$1erson"],
+  [/(database)s$/i, "$1"],
   [/(quiz)zes$/i, "$1"],
   [/(matr)ices$/i, "$1ix"],
   [/(vert|ind)ices$/i, "$1ex"],
-  [/^(ox)en$/i, "$1"],
+  [/^(ox)en/i, "$1"],
   [/(alias|status)(es)?$/i, "$1"],
   [/(octop|vir)(us|i)$/i, "$1us"],
   [/^(a)x[ie]s$/i, "$1xis"],
@@ -219,7 +264,7 @@ const SINGULAR_RULES: ReadonlyArray<readonly [RegExp, string]> = [
   [/(shoe)s$/i, "$1"],
   [/(o)es$/i, "$1"],
   [/(bus)(es)?$/i, "$1"],
-  [/([ml])ice$/i, "$1ouse"],
+  [/^(m|l)ice$/i, "$1ouse"],
   [/(x|ch|ss|sh)es$/i, "$1"],
   [/(m)ovies$/i, "$1ovie"],
   [/(s)eries$/i, "$1eries"],
@@ -228,28 +273,22 @@ const SINGULAR_RULES: ReadonlyArray<readonly [RegExp, string]> = [
   [/(tive)s$/i, "$1"],
   [/(hive)s$/i, "$1"],
   [/([^f])ves$/i, "$1fe"],
-  [/(analy|ba|diagno|parenthe|progno|synop|the)(sis|ses)$/i, "$1sis"],
-  [/([ti])(um|a)$/i, "$1um"],
+  [/(^analy)(sis|ses)$/i, "$1sis"],
+  [/((a)naly|(b)a|(d)iagno|(p)arenthe|(p)rogno|(s)ynop|(t)he)(sis|ses)$/i, "$1sis"],
+  [/([ti])a$/i, "$1um"],
   [/(n)ews$/i, "$1ews"],
   [/(ss)$/i, "$1"],
   [/s$/i, ""],
 ];
 
 export function singularize(word: string): string {
-  const lower = word.toLowerCase();
-  if (UNCOUNTABLE.has(lower)) return word;
-  const irregular = IRREGULAR.get(lower);
-  if (irregular) return irregular;
+  if (UNCOUNTABLE_RE.test(word)) return word;
   for (const [re, repl] of SINGULAR_RULES) {
     if (re.test(word)) return word.replace(re, repl);
   }
   return word;
 }
 
-/**
- * The constant an association name implies: `items` → `Item`, `people` → `Person`,
- * `api_clients` → `APIClient` once `inflect.acronym "API"` is configured.
- */
 export function associationConstant(name: string, acronyms: ReadonlyMap<string, string>): string {
   return camelize(singularize(name), acronyms);
 }

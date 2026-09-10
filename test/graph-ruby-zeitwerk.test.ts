@@ -19,6 +19,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { buildGraph } from "../src/graph/build.js";
+import { isClean, probeDrift } from "../src/graph/fingerprint.js";
+import { extractInputsKey } from "../src/graph/extract-cache.js";
 import { readGraph, wiringPath } from "../src/graph/write.js";
 import type { GraphV1 } from "../src/graph/types.js";
 
@@ -190,4 +192,59 @@ test("zeitwerk: lexical nesting still wins over the autoload map", async () => {
       );
     },
   );
+});
+
+/*
+ * Freshness. Rails detection reads two files, and only one of them is Ruby.
+ */
+
+test("zeitwerk: editing the Gemfile out of Rails registers as drift", async () => {
+  // The whole resolver configuration hangs off this one line, and a Gemfile is not a
+  // source file, so nothing was watching it. Queries kept answering from a
+  // Zeitwerk-resolved graph that an explicit rebuild would have thrown away — and the
+  // probe, which is what decides whether to rebuild, said everything was clean.
+  const dir = mkdtempSync(join(tmpdir(), "graft-ruby-zw-fresh-"));
+  try {
+    for (const [name, content] of Object.entries({ ...RAILS, ...AMBIGUOUS_THING })) {
+      const abs = join(dir, name);
+      mkdirSync(dirname(abs), { recursive: true });
+      writeFileSync(abs, content);
+    }
+    await buildGraph(dir);
+    assert.ok(isClean(probeDrift(dir, join(dir, "graft"))!), "clean immediately after a build");
+
+    writeFileSync(join(dir, "Gemfile"), `source "https://rubygems.org"\ngem "sinatra"\n`);
+    assert.deepEqual(probeDrift(dir, join(dir, "graft"))!.changed, ["Gemfile"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("zeitwerk: adding a Gemfile registers as drift too", async () => {
+  // The other direction: a repo can BECOME a Rails app, and an appearing file is not
+  // a changed one.
+  const dir = mkdtempSync(join(tmpdir(), "graft-ruby-zw-fresh2-"));
+  try {
+    for (const [name, content] of Object.entries({ "config/application.rb": RAILS["config/application.rb"], ...AMBIGUOUS_THING })) {
+      const abs = join(dir, name);
+      mkdirSync(dirname(abs), { recursive: true });
+      writeFileSync(abs, content);
+    }
+    await buildGraph(dir);
+    assert.ok(isClean(probeDrift(dir, join(dir, "graft"))!));
+
+    writeFileSync(join(dir, "Gemfile"), RAILS.Gemfile);
+    assert.deepEqual(probeDrift(dir, join(dir, "graft"))!.added, ["Gemfile"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("zeitwerk: an acronym's SPELLING changes the extraction-cache identity", async () => {
+  // `inflect.acronym "API"` and `inflect.acronym "Api"` both key on `api` and imply
+  // different constants — `APIClient` versus `ApiClient`. Keying the memo on the keys
+  // alone let an incremental build replay parses made under the other spelling.
+  const key = (v: string) => extractInputsKey({ acronyms: new Map([["api", v]]) });
+  assert.notEqual(key("API"), key("Api"));
+  assert.equal(extractInputsKey(null), "plain");
 });

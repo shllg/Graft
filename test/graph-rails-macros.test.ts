@@ -399,20 +399,51 @@ test("rails macros: a scope's body is walked, not swallowed with the macro", asy
   );
 });
 
-test("rails macros: an association extension block is not swallowed either", async () => {
+test("rails macros: an association extension block belongs to the proxy, not the model", async () => {
+  // Two things have to be true at once, and the first version of this got the second
+  // one wrong. The block must not be SWALLOWED — consuming a macro without descending
+  // is how `scope` silently dropped every call in its own body. But `def latest`
+  // inside `has_many :items do ... end` is defined on the association proxy, so
+  // `order.latest` raises NoMethodError while `order.items.latest` works. Minting it
+  // as `Order#latest` invents a method the class does not have, and a false method is
+  // not inert: `before_save :latest` would then bind to it. So it lands under the
+  // generated reader, which is the closest thing the graph has to that proxy.
   await withGraph(
     {
       ...RAILS,
       "app/models/item.rb": `class Item < ApplicationRecord\nend\n`,
       "app/models/order.rb":
-        `class Order < ApplicationRecord\n  has_many :items do\n    def latest; end\n  end\nend\n`,
+        `class Order < ApplicationRecord\n  has_many :items do\n    def latest\n      reorder(:id).first\n    end\n  end\nend\n`,
     },
     (g) => {
-      assert.ok(
-        g.nodes.some((n) => n.id === "app/models/order.rb#Order.latest" && n.origin === "ast"),
-        "a def inside the extension block is still a real, hand-written method",
-      );
       assert.ok(g.nodes.some((n) => n.id === "app/models/order.rb#Order.items" && n.origin === "synthesized"));
+      assert.ok(
+        g.nodes.some((n) => n.id === "app/models/order.rb#Order.items.latest" && n.origin === "ast"),
+        "the def is still a real, hand-written method — under the reader",
+      );
+      assert.ok(
+        !g.nodes.some((n) => n.id === "app/models/order.rb#Order.latest"),
+        "and not on the model, where Rails never put it",
+      );
+    },
+  );
+});
+
+test("rails macros: an extension-block method cannot absorb a callback", async () => {
+  // The consequence the placement exists to prevent, stated as its own test.
+  await withGraph(
+    {
+      ...RAILS,
+      "app/models/item.rb": `class Item < ApplicationRecord\nend\n`,
+      "app/models/order.rb":
+        `class Order < ApplicationRecord\n  before_save :latest\n  has_many :items do\n    def latest; end\n  end\nend\n`,
+    },
+    (g) => {
+      assert.deepEqual(
+        g.edges.filter((e) => e.relation === "calls" && e.source === "app/models/order.rb#Order").map((e) => e.target),
+        [],
+        "the callback names no method this class has, so it declines",
+      );
     },
   );
 });
@@ -509,6 +540,296 @@ test("rails macros: an explicit def wins over the macro that would generate it",
       assert.ok(
         g.nodes.some((n) => n.id === "app/models/current.rb#Current.user" && n.origin === "synthesized"),
         "the attribute that is NOT overridden is still synthesized",
+      );
+    },
+  );
+});
+
+/*
+ * Options that change the ANSWER, not just the detail.
+ *
+ * Every expectation below was read off a running ActiveRecord 8.1 rather than from
+ * the guides — `Post.instance_methods.grep(...)` — because in each case the macro
+ * generates a differently-named method, or none, and this was synthesizing the
+ * unoptioned name regardless. A synthesized method that Rails does not define is
+ * worse than a missing one: it can absorb a callback, and it adds ambiguity that
+ * suppresses a real match somewhere else.
+ */
+
+test("rails macros: delegate prefix: true names the method after the target", async () => {
+  // `delegate :name, to: :user, prefix: true` defines `user_name`, not `name`.
+  await withGraph(
+    {
+      ...RAILS,
+      "app/models/post.rb":
+        `class Post < ApplicationRecord\n  belongs_to :user\n  delegate :name, to: :user, prefix: true\nend\n`,
+      "app/models/user.rb": `class User < ApplicationRecord\nend\n`,
+    },
+    (g) => {
+      const names = synthesized(g, "app/models/post.rb#Post");
+      assert.ok(names.includes("user_name"), `expected user_name, got ${names.join(", ")}`);
+      assert.ok(!names.includes("name"), "the unprefixed name is not defined on Post");
+    },
+  );
+});
+
+test("rails macros: delegate prefix: :admin names it after the given word", async () => {
+  await withGraph(
+    {
+      ...RAILS,
+      "app/models/post.rb":
+        `class Post < ApplicationRecord\n  delegate :name, to: :user, prefix: :admin\nend\n`,
+    },
+    (g) => {
+      assert.ok(synthesized(g, "app/models/post.rb#Post").includes("admin_name"));
+    },
+  );
+});
+
+test("rails macros: store_accessor honours prefix and suffix", async () => {
+  // prefix/suffix `true` both mean "use the store column".
+  await withGraph(
+    {
+      ...RAILS,
+      "app/models/pref.rb":
+        `class Pref < ApplicationRecord\n  store_accessor :settings, :theme, prefix: true\nend\n`,
+      "app/models/other.rb":
+        `class Other < ApplicationRecord\n  store_accessor :settings, :lang, suffix: true\nend\n`,
+    },
+    (g) => {
+      const pref = synthesized(g, "app/models/pref.rb#Pref");
+      assert.ok(pref.includes("settings_theme") && pref.includes("settings_theme="));
+      assert.ok(!pref.includes("theme"), "the unprefixed key is not a method");
+      assert.ok(synthesized(g, "app/models/other.rb#Other").includes("lang_settings"));
+    },
+  );
+});
+
+test("rails macros: an enum with scopes and instance methods off generates nothing", async () => {
+  await withGraph(
+    {
+      ...RAILS,
+      "app/models/doc.rb":
+        `class Doc < ApplicationRecord\n  enum :status, [:draft, :live], scopes: false, instance_methods: false\nend\n`,
+    },
+    (g) => {
+      assert.deepEqual(synthesized(g, "app/models/doc.rb#Doc"), []);
+    },
+  );
+});
+
+test("rails macros: enum scopes: false keeps the predicates and drops the scopes", async () => {
+  await withGraph(
+    {
+      ...RAILS,
+      "app/models/doc.rb": `class Doc < ApplicationRecord\n  enum :status, [:draft], scopes: false\nend\n`,
+    },
+    (g) => {
+      assert.deepEqual(synthesized(g, "app/models/doc.rb#Doc"), ["draft!", "draft?"]);
+    },
+  );
+});
+
+test("rails macros: enum prefix: true renames every generated method", async () => {
+  await withGraph(
+    {
+      ...RAILS,
+      "app/models/doc.rb": `class Doc < ApplicationRecord\n  enum :status, [:draft], prefix: true\nend\n`,
+    },
+    (g) => {
+      assert.deepEqual(synthesized(g, "app/models/doc.rb#Doc"), ["status_draft", "status_draft!", "status_draft?"]);
+    },
+  );
+});
+
+test("rails macros: a polymorphic belongs_to names no class", async () => {
+  // `belongs_to :subject, polymorphic: true` has no single target by definition, and
+  // was pointing at whatever model happened to be called `Subject`.
+  await withGraph(
+    {
+      ...RAILS,
+      "app/models/note.rb": `class Note < ApplicationRecord\n  belongs_to :subject, polymorphic: true\nend\n`,
+      "app/models/subject.rb": `class Subject < ApplicationRecord\nend\n`,
+    },
+    (g) => {
+      assert.deepEqual(
+        g.edges.filter((e) => e.relation === "references" && e.source === "app/models/note.rb#Note"),
+        [],
+      );
+      assert.ok(synthesized(g, "app/models/note.rb#Note").includes("subject"), "the reader still exists");
+    },
+  );
+});
+
+test("rails macros: has_many :through resolves via source:, not via its own name", async () => {
+  // `has_many :members, through: :memberships, source: :user` is a collection of
+  // `User`. It was resolving to an unrelated `Member` model.
+  await withGraph(
+    {
+      ...RAILS,
+      "app/models/team.rb":
+        `class Team < ApplicationRecord\n  has_many :memberships\n` +
+        `  has_many :members, through: :memberships, source: :user\nend\n`,
+      "app/models/member.rb": `class Member < ApplicationRecord\nend\n`,
+      "app/models/user.rb": `class User < ApplicationRecord\nend\n`,
+      "app/models/membership.rb": `class Membership < ApplicationRecord\n  belongs_to :user\nend\n`,
+    },
+    (g) => {
+      const targets = g.edges
+        .filter((e) => e.relation === "references" && e.source === "app/models/team.rb#Team")
+        .map((e) => e.target)
+        .sort();
+      assert.deepEqual(targets, ["app/models/membership.rb#Membership", "app/models/user.rb#User"]);
+    },
+  );
+});
+
+test("rails macros: a bare has_many :through still uses the name's own implication", async () => {
+  // The recall half of the `through:` rule, and the reason it is narrow. Without
+  // `source:`, Rails looks for `:users`/`:user` on the through-class and lands on
+  // `User` — the same answer the plural implies. Declining the whole bare form cost
+  // real edges (`has_many :tags, through: :document_tags` among them) to guard a
+  // redirect that only `source:` can express.
+  await withGraph(
+    {
+      ...RAILS,
+      "app/models/team.rb":
+        `class Team < ApplicationRecord\n  has_many :memberships\n  has_many :users, through: :memberships\nend\n`,
+      "app/models/user.rb": `class User < ApplicationRecord\nend\n`,
+      "app/models/membership.rb": `class Membership < ApplicationRecord\nend\n`,
+    },
+    (g) => {
+      assert.deepEqual(
+        g.edges
+          .filter((e) => e.relation === "references" && e.source === "app/models/team.rb#Team")
+          .map((e) => e.target)
+          .sort(),
+        ["app/models/membership.rb#Membership", "app/models/user.rb#User"],
+      );
+    },
+  );
+});
+
+test("rails macros: an unreadable :class_name => CONST declines in both hash syntaxes", async () => {
+  // The old presence check was a regex for `class_name:` and missed the hashrocket
+  // spelling entirely, so this fell through to the inflected `Owner`.
+  await withGraph(
+    {
+      ...RAILS,
+      "app/models/thing.rb":
+        `class Thing < ApplicationRecord\n  OWNER_CLASS = "Person"\n  belongs_to :owner, :class_name => OWNER_CLASS\nend\n`,
+      "app/models/owner.rb": `class Owner < ApplicationRecord\nend\n`,
+    },
+    (g) => {
+      assert.deepEqual(
+        g.edges.filter((e) => e.relation === "references" && e.target === "app/models/owner.rb#Owner"),
+        [],
+      );
+      assert.ok(synthesized(g, "app/models/thing.rb#Thing").includes("owner"), "the reader still exists");
+    },
+  );
+});
+
+test("rails macros: a callback keeps its class's namespace", async () => {
+  // `before_save :stamp` inside `A::User` states its receiver exactly. Resolving it
+  // through the bare owner name `User` let it bind to a `stamp` on an unrelated
+  // `B::User` — a wrong edge from a declaration that leaves no room for doubt.
+  await withGraph(
+    {
+      ...RAILS,
+      "app/models/a/user.rb": `module A\n  class User < ApplicationRecord\n    before_save :stamp\n  end\nend\n`,
+      "app/models/b/user.rb": `module B\n  class User < ApplicationRecord\n    def stamp; end\n  end\nend\n`,
+    },
+    (g) => {
+      assert.deepEqual(
+        g.edges.filter((e) => e.relation === "calls" && e.source === "app/models/a/user.rb#A.User"),
+        [],
+      );
+    },
+  );
+});
+
+test("rails macros: a namespaced callback still finds its own class's method", async () => {
+  // The other half: keeping the namespace must not cost the edges that were right.
+  await withGraph(
+    {
+      ...RAILS,
+      "app/models/a/user.rb":
+        `module A\n  class User < ApplicationRecord\n    before_save :stamp\n\n    def stamp; end\n  end\nend\n`,
+      "app/models/b/user.rb": `module B\n  class User < ApplicationRecord\n    def stamp; end\n  end\nend\n`,
+    },
+    (g) => {
+      assert.deepEqual(
+        g.edges
+          .filter((e) => e.relation === "calls" && e.source === "app/models/a/user.rb#A.User")
+          .map((e) => e.target),
+        ["app/models/a/user.rb#A.User.stamp"],
+      );
+    },
+  );
+});
+
+test("rails macros: a callback resolves through the class's own Ruby ancestors", async () => {
+  await withGraph(
+    {
+      ...RAILS,
+      "app/models/a/base.rb": `module A\n  class Base < ApplicationRecord\n    def stamp; end\n  end\nend\n`,
+      "app/models/a/user.rb": `module A\n  class User < Base\n    before_save :stamp\n  end\nend\n`,
+    },
+    (g) => {
+      assert.deepEqual(
+        g.edges
+          .filter((e) => e.relation === "calls" && e.source === "app/models/a/user.rb#A.User")
+          .map((e) => e.target),
+        ["app/models/a/base.rb#A.Base.stamp"],
+      );
+    },
+  );
+});
+
+test("rails macros: an association in `included do` belongs to the includers", async () => {
+  // The recorded deviation said callback AND association edges are re-emitted per
+  // includer. Only the callbacks were. `belongs_to :user` inside `Owned` is `Post`'s
+  // association — `Owned` has no table and never runs it.
+  await withGraph(
+    {
+      ...RAILS,
+      "app/models/concerns/owned.rb":
+        `module Owned\n  extend ActiveSupport::Concern\n  included do\n    belongs_to :user\n  end\nend\n`,
+      "app/models/post.rb": `class Post < ApplicationRecord\n  include Owned\nend\n`,
+      "app/models/user.rb": `class User < ApplicationRecord\nend\n`,
+    },
+    (g) => {
+      const refs = g.edges
+        .filter((e) => e.relation === "references" && e.target === "app/models/user.rb#User")
+        .map((e) => e.source)
+        .sort();
+      // Both: the includer, because that is the class that gets the association, and
+      // the concern, because naming `User` is a fact about its own source text and
+      // has to survive the includer cap.
+      assert.deepEqual(refs, ["app/models/concerns/owned.rb#Owned", "app/models/post.rb#Post"]);
+    },
+  );
+});
+
+test("rails macros: extending a concern does not run its `included do`", async () => {
+  // `extend` never fires the `included` hook, so nothing declared there belongs to
+  // the extending class.
+  await withGraph(
+    {
+      ...RAILS,
+      "app/models/concerns/owned.rb":
+        `module Owned\n  extend ActiveSupport::Concern\n  included do\n    belongs_to :user\n  end\nend\n`,
+      "app/models/post.rb": `class Post < ApplicationRecord\n  extend Owned\nend\n`,
+      "app/models/user.rb": `class User < ApplicationRecord\nend\n`,
+    },
+    (g) => {
+      assert.deepEqual(
+        g.edges
+          .filter((e) => e.relation === "references" && e.target === "app/models/user.rb#User")
+          .map((e) => e.source),
+        ["app/models/concerns/owned.rb#Owned"],
+        "the concern still names User; the extending class does not get the association",
       );
     },
   );

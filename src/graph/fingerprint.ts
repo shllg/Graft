@@ -19,12 +19,14 @@
  * rebuild is just cold.
  */
 import { join } from "node:path";
+import { readFileSync, statSync } from "node:fs";
 import { CACHE_DIR } from "../context/node-file.js";
 import { contentHash } from "../util/id.js";
 import { readSourceFile } from "../util/source.js";
 import { readJson, writeJsonAtomic } from "../util/state.js";
 import { extractorStamp, pruneSidecars, type ExtractEntry } from "./extract-cache.js";
 import { listSourceStats } from "./source-files.js";
+import { RAILS_WITNESS_FILES } from "./zeitwerk.js";
 
 export const FINGERPRINT_PREFIX = "fingerprint";
 const FINGERPRINT_VERSION = 1;
@@ -88,9 +90,18 @@ export function writeFingerprint(
   outDir: string,
   entries: Record<string, ExtractEntry>,
   onlyDirs?: string[],
+  root?: string,
 ): boolean {
   const files: Record<string, Print> = {};
   for (const [rel, e] of Object.entries(entries)) files[rel] = [e.size, e.mtimeMs, e.hash];
+  // Non-source files the RESOLVER's configuration depends on. Without them, turning a
+  // repo from a Rails app into a plain Ruby one — a one-line Gemfile edit — left the
+  // probe reporting clean while every constant edge in the graph was now resolved by
+  // rules that no longer apply. See RAILS_WITNESS_FILES.
+  if (root) for (const rel of RAILS_WITNESS_FILES) {
+    const print = witnessPrint(root, rel);
+    if (print) files[rel] = print;
+  }
   try {
     const record: Fingerprint = { version: FINGERPRINT_VERSION, extractor: stamp(), files };
     if (onlyDirs && onlyDirs.length > 0) record.onlyDirs = onlyDirs;
@@ -185,6 +196,18 @@ export function probeDrift(root: string, outDir: string): Drift | null {
     if (now !== hash) drift.changed.push(f.rel);
   }
 
+  // The witness files are not enumerated by `listSourceStats`, so they are stated
+  // explicitly — in all three directions, since a Gemfile can appear as well as
+  // change or vanish.
+  for (const rel of RAILS_WITNESS_FILES) {
+    seen.add(rel);
+    const print = witnessPrint(root, rel);
+    const recorded = fp.files[rel];
+    if (print && !recorded) drift.added.push(rel);
+    else if (!print && recorded) drift.removed.push(rel);
+    else if (print && recorded && print[2] !== recorded[2]) drift.changed.push(rel);
+  }
+
   for (const rel of Object.keys(fp.files)) {
     if (!seen.has(rel)) drift.removed.push(rel);
   }
@@ -193,4 +216,19 @@ export function probeDrift(root: string, outDir: string): Drift | null {
   drift.added.sort();
   drift.removed.sort();
   return drift;
+}
+
+/** `[size, mtimeMs, hash]` for a tracked non-source file, or null when it is absent.
+ * Always hashed: these are small, read once per build or probe, and a stat fast path
+ * would reintroduce the same-size-same-mtime blind spot for the one input whose
+ * change invalidates the entire graph. */
+function witnessPrint(root: string, rel: string): Print | null {
+  try {
+    const abs = join(root, rel);
+    const st = statSync(abs);
+    if (!st.isFile()) return null;
+    return [st.size, st.mtimeMs, contentHash(readFileSync(abs, "utf8"))];
+  } catch {
+    return null;
+  }
 }

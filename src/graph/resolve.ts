@@ -140,6 +140,9 @@ export function resolveEdges(
   // from ever reaching a TypeScript class of the same name — the guard is in the
   // index, not in a filter the caller has to remember to apply.
   const rubyFqn = new Map<string, NodeV1[]>();
+  // "Owner::Fqn#method" → the method nodes defining it. `#` separates, because `::`
+  // and `.` both occur inside the two halves.
+  const rubyOwnerMethod = new Map<string, NodeV1[]>();
   const hasGoModules = !!opts.goModules?.length;
   for (const n of nodes) {
     if (n.kind === "file") {
@@ -180,6 +183,13 @@ export function resolveEdges(
     if ((n.kind === "class" || n.kind === "module") && RB_EXT.test(n.path)) {
       const fqn = rubyFqnOf(n.id);
       if (fqn) push(rubyFqn, fqn, n);
+    }
+    if (n.kind === "method" && RB_EXT.test(n.path)) {
+      // Owner-qualified by FULL Ruby name, unlike `ownerMethod` above, which is keyed
+      // by the bare class name every language shares. See `RawEdge.rubyOwnerFqn`.
+      const own = rubyFqnOf(n.id);
+      const cut = own?.lastIndexOf("::") ?? -1;
+      if (own && cut > 0) push(rubyOwnerMethod, `${own.slice(0, cut)}#${n.name}`, n);
     }
   }
 
@@ -268,6 +278,29 @@ export function resolveEdges(
     push(classTraits, ownName, e.name);
   }
 
+  /**
+   * Who a Rails macro edge is really about: `[subject node id, its Ruby FQN, its file]`.
+   *
+   * Normally the class the macro is written in — one tuple. Inside an
+   * `ActiveSupport::Concern`'s `included do`, one tuple per INCLUDER, because that is
+   * where the declaration actually runs; the concern itself gets nothing, which is
+   * the honest answer for a module that never executes it. A concern mixed into a
+   * whole model layer would multiply one line into hundreds of edges, so past the cap
+   * the output is none: the declaration is real, but the graph would stop being a
+   * description and start being a hub.
+   */
+  const rubyMacroSubjects = (e: RawEdge): Array<[string, string | null, string]> => {
+    if (!e.viaConcern) return [[e.source, e.rubyOwnerFqn ?? null, e.file]];
+    const includers = rubyIncluders.get(e.source) ?? [];
+    if (includers.length > RUBY_CONCERN_INCLUDER_CAP) return [];
+    const out: Array<[string, string | null, string]> = [];
+    for (const includer of includers) {
+      const node = byId.get(includer);
+      if (node) out.push([includer, rubyFqnOf(includer), node.path]);
+    }
+    return out;
+  };
+
   const out: EdgeV1[] = [];
   const seen = new Set<string>();
   const add = (source: string, target: string, relation: Relation, confidence: EdgeV1["confidence"]) => {
@@ -343,14 +376,35 @@ export function resolveEdges(
         // into the graph as a phantom, and `graph-quality --strict` counts
         // dangling endpoints for exactly that reason.
         const hit = resolveRubyConstant(e.name, e.nesting, e.file, rubyFqn, rubyAncestors, rubyShadow, zeitwerk, true);
-        if (hit && hit.id !== e.source) add(e.source, hit.id, "references", hit.confidence);
+        if (!hit) continue;
+        if (hit.id !== e.source) add(e.source, hit.id, "references", hit.confidence);
+        // An association declared inside an `included do` is also each INCLUDER's —
+        // `belongs_to :user` in `Owned` gives `Post` that association. Callbacks
+        // declared there were already re-attributed; leaving associations behind made
+        // a documented behaviour half-true.
+        //
+        // Unlike a callback, the concern KEEPS its own edge here. A callback names a
+        // method the concern does not own, so attributing it to the concern is simply
+        // wrong; a constant reference is a fact about the concern's own source text,
+        // which stays true however many classes include it. It also has to stay true
+        // past the includer cap: `Tenancy::Scoped` is included by 148 models, and
+        // re-attribution alone would have turned one correct edge into none.
+        if (e.viaConcern) {
+          for (const [subject] of rubyMacroSubjects(e)) {
+            if (hit.id !== subject) add(subject, hit.id, "references", hit.confidence);
+          }
+        }
       } else if (e.recvType && RB_EXT.test(e.file)) {
         // M2: `validates :email` names an ATTRIBUTE of this class, not a constant —
         // owner-qualified, so it resolves exactly like a member call and declines
         // the same way. Most of these find nothing, because a plain database column
         // has no node anywhere; that is the correct answer, not a gap.
-        const hit = resolveTypedMember(e.recvType, e.name, e.file, ownerMethod, classParents, classTraits);
-        if (hit && hit !== "ambiguous" && hit.id !== e.source) add(e.source, hit.id, "references", hit.confidence);
+        for (const [subject, ownerFqn, subjFile] of rubyMacroSubjects(e)) {
+          const hit = ownerFqn
+            ? resolveRubyOwnerMethod(ownerFqn, e.name, subjFile, rubyOwnerMethod, rubyAncestors)
+            : resolveTypedMember(e.recvType, e.name, subjFile, ownerMethod, classParents, classTraits);
+          if (hit && hit !== "ambiguous" && hit.id !== subject) add(subject, hit.id, "references", hit.confidence);
+        }
       } else if (e.file.endsWith(".php") && byId.get(e.source)?.origin === "ast") {
         // PHP attribute without a `use` import (same-file or globally unique class).
         const refKinds: Kind[] = ["class", "interface", "trait", "enum"];
@@ -383,23 +437,19 @@ export function resolveEdges(
         if (hit && hit.id !== e.source) add(e.source, hit.id, "references", hit.confidence);
       }
     } else if (e.relation === "calls") {
-      if (e.viaConcern) {
-        // Declared inside an `ActiveSupport::Concern`'s `included do`, so the class
-        // that runs it is each INCLUDER, not the concern. Re-resolve per includer
-        // against that class's own method set: `before_save :stamp_audit` binds to
-        // `User#stamp_audit` in one includer and to nothing at all in another that
-        // never defines it, and both of those are the right answer for that class.
-        const includers = rubyIncluders.get(e.source) ?? [];
-        // A concern mixed into a whole model layer would otherwise multiply one
-        // declaration into hundreds of edges. Past the cap the honest output is
-        // none: the declaration is real but the graph stops being a description
-        // and starts being a hub.
-        if (includers.length > RUBY_CONCERN_INCLUDER_CAP) continue;
-        for (const includer of includers) {
-          const recv = byId.get(includer)?.name;
-          if (!recv) continue;
-          const hit = resolveTypedMember(recv, e.name!, byId.get(includer)!.path, ownerMethod, classParents, classTraits, e.argCount);
-          if (hit && hit !== "ambiguous") add(includer, hit.id, "calls", hit.confidence);
+      if (e.viaConcern || e.rubyOwnerFqn) {
+        // A Rails macro states its receiver exactly — the class it is written in, or,
+        // inside an `ActiveSupport::Concern`'s `included do`, each class that INCLUDES
+        // the concern. Either way the subject is a known class node, so this resolves
+        // by full constant path rather than by the bare class name every language
+        // shares. `before_save :stamp_audit` binds to `User#stamp_audit` in one
+        // includer and to nothing at all in another that never defines it, and both
+        // of those are the right answer for that class.
+        for (const [subject, ownerFqn, subjFile] of rubyMacroSubjects(e)) {
+          const hit = ownerFqn
+            ? resolveRubyOwnerMethod(ownerFqn, e.name!, subjFile, rubyOwnerMethod, rubyAncestors)
+            : resolveTypedMember(e.recvType!, e.name!, subjFile, ownerMethod, classParents, classTraits, e.argCount);
+          if (hit && hit !== "ambiguous" && hit.id !== subject) add(subject, hit.id, "calls", hit.confidence);
         }
         continue;
       }
@@ -665,6 +715,38 @@ function resolveRubyQualified(
     const next = scopes.map((s) => `${s}::${tail[i]}`).find(declares);
     if (!next) return null; // Ruby raises NameError here; the graph declines
     cur = next;
+  }
+  return null;
+}
+
+/**
+ * A method on a Ruby class named by its FULL constant path, or on one of that class's
+ * own ancestors.
+ *
+ * The generic `resolveTypedMember` keys on a bare class name, which is right for
+ * languages where that is all a receiver expression yields. It is not right for a
+ * Rails macro: `before_save :stamp` inside `A::User` states its receiver exactly, and
+ * bare-name keying let that bind to a `stamp` defined on an unrelated `B::User`.
+ *
+ * Ambiguity declines. Two files defining the same method on the same fully-qualified
+ * class is a real choice this cannot make.
+ */
+function resolveRubyOwnerMethod(
+  ownerFqn: string,
+  name: string,
+  file: string,
+  index: Map<string, NodeV1[]>,
+  ancestors: Map<string, string[]>,
+): { id: string; confidence: EdgeV1["confidence"] } | "ambiguous" | null {
+  const walk = ancestorPrefixes(ownerFqn, ancestors);
+  if (walk.truncated) return null;
+  for (const scope of [ownerFqn, ...walk.prefixes]) {
+    const cands = index.get(`${scope}#${name}`);
+    if (!cands || cands.length === 0) continue;
+    const sameFile = cands.filter((c) => c.path === file);
+    if (sameFile.length === 1) return { id: sameFile[0].id, confidence: "extracted" };
+    if (cands.length === 1) return { id: cands[0].id, confidence: "inferred" };
+    return "ambiguous";
   }
   return null;
 }

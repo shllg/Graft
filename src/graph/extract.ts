@@ -175,6 +175,14 @@ export interface RawEdge {
    * records the FQN and declines rather than resolving past it to an unrelated
    * top-level class. Ruby finds the constant here; we simply cannot name it. */
   rubyConstDecl?: boolean;
+  /** Ruby only: the fully-qualified name of the class this edge was declared in
+   * (`Api::V1::User`), for the macro edges whose receiver is that class and is known
+   * exactly. The generic `recvType` is a BARE class name shared across every
+   * language, so `before_save :stamp` inside `A::User` matched a `stamp` defined on
+   * an unrelated `B::User` — a wrong edge produced from a declaration that leaves no
+   * room for doubt about its receiver. This resolves against an FQN-keyed method
+   * index and the class's own Ruby ancestor chain instead. */
+  rubyOwnerFqn?: string;
   /** Ruby only: this edge was declared inside an `ActiveSupport::Concern`'s
    * `included do` block, so its real subjects are the classes that INCLUDE the
    * concern, not the concern itself. `resolve.ts` re-attributes it across the
@@ -961,15 +969,29 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
         const macroEdges = rubyMacroEdges(node, ctx, ctx.parentId);
         const declared = macroMethods.filter((m) => !ctx.rubyOwnDefs.has(m.name));
         if (declared.length > 0 || macroEdges.length > 0) {
-          for (const m of declared) emitRubySynthesizedMethod(m, ctx, out, edges, minted, "synthesized");
+          const mintedIds = new Map<string, string>();
+          for (const m of declared) {
+            mintedIds.set(m.name, emitRubySynthesizedMethod(m, ctx, out, edges, minted, "synthesized"));
+          }
           edges.push(...macroEdges);
           // An association extension (`has_many :things do def latest; end end`)
-          // carries a block none of the synthesized methods claimed. Walk it under
-          // the CURRENT context — its contents belong to the class, not to any one
-          // generated reader — so consuming the macro never loses what is inside it.
+          // carries a block none of the synthesized methods claimed. Rails defines
+          // those methods on the association PROXY — `blog.posts.latest` — and not on
+          // the model, so minting `Blog#latest` invents a method the class does not
+          // have, and a false method is not inert: `before_save :latest` could then
+          // bind to it. Scope them under the generated reader, the closest thing the
+          // graph has to that proxy, and keep walking so nothing inside is lost —
+          // consuming a macro without descending is how `scope` silently dropped
+          // every call in its own body.
           const trailing = node.childForFieldName("block");
           if (trailing && !declared.some((m) => sameSyntaxNode(m.hashNode, trailing))) {
-            for (const child of trailing.namedChildren) walk(child, ctx, out, edges, minted);
+            const reader = rubyAssociationReader(node);
+            const readerId = reader ? mintedIds.get(reader) : undefined;
+            const blockCtx: WalkCtx =
+              reader && readerId
+                ? { ...ctx, scope: [...ctx.scope, reader], parentId: readerId, enclosingClass: reader }
+                : ctx;
+            for (const child of trailing.namedChildren) walk(child, blockCtx, out, edges, minted);
           }
           // Return, so the macro call does not ALSO become an ordinary call edge to
           // a function literally named `has_many` — the same reason the mixin and
@@ -2399,7 +2421,28 @@ function rubySymbolArgs(args: Parser.SyntaxNode | null): string[] {
  * (Rails defines them regardless) while the target edge is not, because the only
  * honest description of `class_name: OWNER_CLASS` is that this pass cannot read it.
  */
-function rubyMacroOption(args: Parser.SyntaxNode | null, key: string): string | null {
+/**
+ * A macro option, as a tri-state.
+ *
+ *   - `null`             — the key is not there at all.
+ *   - `{value: null}`    — the key is there and this pass cannot read it.
+ *   - `{value: "User"}`  — a plain string or symbol literal.
+ *   - `{value: true}`    — the literal `true` (`prefix: true`, `polymorphic: true`).
+ *   - `{value: false}`   — the literal `false` (`scopes: false`).
+ *
+ * The middle case is the load-bearing one and it used to be indistinguishable from
+ * the first. `belongs_to :owner, :class_name => OWNER_CLASS` names its target with a
+ * constant this pass cannot evaluate; reading that as "no override given" made it
+ * fall back to the inflected `Owner`, which is a different class. A key that is
+ * present and unreadable must decline, not guess.
+ *
+ * Both hash syntaxes are recognised, because `:class_name => X` is not rare in older
+ * Rails code and a regex for `class_name:` alone silently missed it.
+ */
+function rubyMacroOption(
+  args: Parser.SyntaxNode | null,
+  key: string,
+): { value: string | boolean | null } | null {
   for (const arg of args?.namedChildren ?? []) {
     const pairs = arg.type === "hash" ? arg.namedChildren : arg.type === "pair" ? [arg] : [];
     for (const pair of pairs) {
@@ -2408,15 +2451,69 @@ function rubyMacroOption(args: Parser.SyntaxNode | null, key: string): string | 
       const name = k?.type === "hash_key_symbol" ? k.text : k?.type === "simple_symbol" ? k.text.slice(1) : null;
       if (name !== key) continue;
       const v = pair.childForFieldName("value");
-      if (v?.type === "simple_symbol") return v.text.slice(1);
-      if (v?.type !== "string") return null;
+      if (v?.type === "simple_symbol") return { value: v.text.slice(1) };
+      if (v?.type === "true") return { value: true };
+      if (v?.type === "false") return { value: false };
+      if (v?.type !== "string") return { value: null };
       const content = v.namedChildren.find((c) => c.type === "string_content");
       // An interpolated string has no single `string_content` covering the whole
       // literal, so this also rejects `class_name: "#{prefix}User"` — correctly.
-      return content && content.text === v.text.slice(1, -1) ? content.text : null;
+      return { value: content && content.text === v.text.slice(1, -1) ? content.text : null };
     }
   }
   return null;
+}
+
+/**
+ * Apply a macro's `prefix:`/`suffix:` options to the names it would otherwise define.
+ *
+ * Returns null when an option is present but cannot be read — synthesize nothing
+ * rather than a method under a name Rails will not use. `fallback` is what
+ * `prefix: true` means for this macro: the delegation target, the store column, the
+ * enum attribute.
+ */
+function rubyAffixNames(
+  names: string[],
+  args: Parser.SyntaxNode | null,
+  fallback: string | null,
+): string[] | null {
+  const prefix = rubyMacroAffix(args, "prefix", fallback);
+  const suffix = rubyMacroAffix(args, "suffix", fallback);
+  if (prefix === "unreadable" || suffix === "unreadable") return null;
+  if (!prefix && !suffix) return names;
+  return names.map((n) => {
+    const head = prefix ? `${prefix.affix}_` : "";
+    const tail = suffix ? `_${suffix.affix}` : "";
+    return `${head}${n}${tail}`;
+  });
+}
+
+/** A macro option that names something (`class_name:`, `source:`), as a plain string,
+ * or null when it is absent OR unreadable — for the callers that treat both the same. */
+function rubyMacroName(args: Parser.SyntaxNode | null, key: string): string | null {
+  const opt = rubyMacroOption(args, key);
+  return typeof opt?.value === "string" ? opt.value : null;
+}
+
+/**
+ * The affix a naming option asks for, or null when there is none.
+ *
+ * `prefix: true` means "use `fallback`" — the delegation target for `delegate`, the
+ * store column for `store_accessor`, the attribute for `enum`. `prefix: :admin` names
+ * it outright. Anything else (an unreadable value) yields null, and the caller then
+ * synthesizes nothing rather than a method under the wrong name.
+ */
+function rubyMacroAffix(
+  args: Parser.SyntaxNode | null,
+  key: string,
+  fallback: string | null,
+): { affix: string } | "unreadable" | null {
+  const opt = rubyMacroOption(args, key);
+  if (opt === null) return null;
+  if (opt.value === false) return null;
+  if (opt.value === true) return fallback ? { affix: fallback } : "unreadable";
+  if (typeof opt.value === "string") return { affix: opt.value };
+  return "unreadable";
 }
 
 /** Every `%i[...]`/`%w[...]`/array-of-symbols entry, for `enum`. */
@@ -2497,26 +2594,112 @@ function rubyMacroMethods(node: Parser.SyntaxNode, ctx: WalkCtx): RubySynthesize
     return names.flatMap((n) => [at(n), at(`${n}=`)]);
   }
   if (macro === "store_accessor") {
-    // The store column itself is an ordinary attribute; the rest are its keys.
-    return syms.flatMap((sN) => [at(sN), at(`${sN}=`)]);
+    // `store_accessor :settings, :theme, prefix: true` defines `settings_theme`, NOT
+    // `theme` — verified against a running ActiveRecord, which is also where the
+    // `suffix:` spelling (`theme_settings`) came from. Synthesizing the unprefixed
+    // name invents a method the class does not have, and a false method is not an
+    // inert one: it can absorb a callback and it adds ambiguity that suppresses a
+    // real match elsewhere.
+    const column = syms[0];
+    if (!column) return [];
+    const keys = syms.slice(1);
+    const affixed = rubyAffixNames(keys, args, column);
+    if (affixed === null) return [];
+    // The store column is an ordinary attribute of its own, unaffected by the option.
+    return [at(column), at(`${column}=`), ...affixed.flatMap((n) => [at(n), at(`${n}=`)])];
   }
   if (macro === "delegate") {
     // `delegate :name, :email, to: :user` — every symbol except the `to:` target,
     // which lives in the options hash and is therefore not in `syms`.
-    return syms.map((sN) => at(sN));
+    //
+    // `prefix: true` renames all of them after the target (`user_name`), and
+    // `prefix: :admin` after the given word. Getting this wrong is what put a bare
+    // `name` on the class.
+    const to = rubyMacroName(args, "to");
+    const affixed = rubyAffixNames(syms, args, to);
+    return affixed === null ? [] : affixed.map((sN) => at(sN));
   }
   if (macro === "enum") {
     // Two spellings: `enum status: %i[draft live]` (classic) and
     // `enum :status, %i[draft live]` (Rails 7+). Both declare the same methods.
     let values: string[] = [];
+    const attrName = syms[0] ?? null;
     for (const arg of args?.namedChildren ?? []) {
       const pairs = arg.type === "hash" ? arg.namedChildren : arg.type === "pair" ? [arg] : [];
       for (const pair of pairs) if (pair.type === "pair") values.push(...rubyEnumValues(pair.childForFieldName("value")));
       values.push(...rubyEnumValues(arg));
     }
-    return values.flatMap((v) => [at(v), at(`${v}?`), at(`${v}!`)]);
+    // `prefix:`/`suffix:` rename every generated method after the attribute, and
+    // `scopes: false` / `instance_methods: false` remove whole families of them. An
+    // enum declared with both off generates NOTHING, and this used to synthesize six
+    // methods for it. Confirmed against a running ActiveRecord in each combination.
+    const named = rubyAffixNames(values, args, attrName);
+    if (named === null) return [];
+    const scopes = rubyMacroOption(args, "scopes")?.value !== false;
+    const instanceMethods = rubyMacroOption(args, "instance_methods")?.value !== false;
+    return named.flatMap((v) => [
+      ...(scopes ? [at(v)] : []),
+      ...(instanceMethods ? [at(`${v}?`), at(`${v}!`)] : []),
+    ]);
   }
   return [];
+}
+
+/** The reader method an association macro generates — the name its extension block's
+ * methods hang off. Null for any other macro, which never takes one. */
+function rubyAssociationReader(node: Parser.SyntaxNode): string | null {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || !AR_ASSOCIATIONS.has(methodNode.text)) return null;
+  if (node.childForFieldName("receiver")) return null;
+  return rubySymbolArgs(node.childForFieldName("arguments"))[0] ?? null;
+}
+
+/**
+ * The class an association names, or null when the declaration does not establish one.
+ *
+ * Every branch here is a case where the inflected guess is provably not the answer,
+ * and each was reproduced against a running Rails before it was written:
+ *
+ *   - `polymorphic: true` has no single target class by definition. `belongs_to
+ *     :subject, polymorphic: true` was pointing at an unrelated `Subject` model.
+ *   - `through:` names an association on ANOTHER class, so the target is whatever
+ *     that one resolves to — `has_many :members, through: :memberships, source: :user`
+ *     is `User`, and was pointing at an unrelated `Member`. The `source:`/`class_name:`
+ *     forms are readable here; the bare `through:` form is not, because it needs the
+ *     other class's declarations, which this pass has not seen yet.
+ *   - a `class_name:` that is present but unreadable means "cannot name it", and must
+ *     not fall through to the plural's implication.
+ *
+ * Declining costs an edge. Guessing costs an agent a refactor against the wrong model.
+ */
+function rubyAssociationTarget(
+  macro: string,
+  name: string,
+  args: Parser.SyntaxNode | null,
+  ctx: WalkCtx,
+): string | null {
+  const className = rubyMacroOption(args, "class_name");
+  if (className) return typeof className.value === "string" ? className.value : null;
+  if (rubyMacroOption(args, "polymorphic")?.value === true) return null;
+  const through = rubyMacroOption(args, "through");
+  if (through) {
+    // `source:` names the association on the through-class and REDIRECTS the target:
+    // `has_many :members, through: :memberships, source: :user` is a collection of
+    // `User`, and the plural's own implication — `Member` — is a different model that
+    // happens to exist. `source_type:` names the class outright.
+    //
+    // With neither, the plural's implication is right, because that is exactly what
+    // Rails itself falls back to: it looks for an association named `:tags` or `:tag`
+    // on the through-class, and absent a `class_name:` override there, that is `Tag`.
+    // Declining the whole bare form was measured to cost real edges — `has_many :tags,
+    // through: :document_tags` among them — to guard a case this cannot see anyway.
+    if (typeof through.value !== "string" && through.value !== true) return null;
+    const sourceType = rubyMacroName(args, "source_type");
+    if (sourceType) return sourceType;
+    const source = rubyMacroOption(args, "source");
+    if (source) return typeof source.value === "string" ? associationConstant(source.value, ctx.rubyRails!.acronyms) : null;
+  }
+  return associationConstant(name, ctx.rubyRails!.acronyms);
 }
 
 /**
@@ -2534,17 +2717,16 @@ function rubyMacroEdges(node: Parser.SyntaxNode, ctx: WalkCtx, classId: string):
   const out: RawEdge[] = [];
 
   if (AR_ASSOCIATIONS.has(macro) && syms[0]) {
-    const explicit = rubyMacroOption(args, "class_name");
-    // A `class_name:` key that is present but unreadable means "cannot name it" —
-    // and must NOT fall back to the inflected guess, or an explicitly-overridden
-    // association silently points at whatever the plural happened to imply.
-    const hasClassNameKey = /(^|[\s(,])class_name:/.test(node.text);
-    if (explicit === null && hasClassNameKey) return out;
-    const target = explicit ?? associationConstant(syms[0], ctx.rubyRails!.acronyms);
-    out.push({
-      source: classId, relation: "references", name: target, file: ctx.rel,
-      nesting: [...ctx.rubyNesting], // resolved by M1's constant resolver, never by bare name
-    });
+    const target = rubyAssociationTarget(macro, syms[0], args, ctx);
+    if (target) {
+      out.push({
+        source: classId, relation: "references", name: target, file: ctx.rel,
+        nesting: [...ctx.rubyNesting], // resolved by M1's constant resolver, never by bare name
+        // Declared inside an `included do`, this association belongs to each class
+        // that includes the concern, exactly as a callback declared there does.
+        ...(ctx.rubyIncludedBlock ? { viaConcern: true } : {}),
+      });
+    }
     return out;
   }
 
@@ -2557,6 +2739,7 @@ function rubyMacroEdges(node: Parser.SyntaxNode, ctx: WalkCtx, classId: string):
       out.push({
         source: classId, relation: "calls", name: sym, file: ctx.rel,
         viaMember: true, recvType: ctx.enclosingClass!,
+        ...(ctx.rubyNesting[0] ? { rubyOwnerFqn: ctx.rubyNesting[0] } : {}),
         ...(ctx.rubyIncludedBlock ? { viaConcern: true } : {}),
       });
     }
@@ -2571,6 +2754,8 @@ function rubyMacroEdges(node: Parser.SyntaxNode, ctx: WalkCtx, classId: string):
       out.push({
         source: classId, relation: "references", name: sym, file: ctx.rel,
         recvType: ctx.enclosingClass!,
+        ...(ctx.rubyNesting[0] ? { rubyOwnerFqn: ctx.rubyNesting[0] } : {}),
+        ...(ctx.rubyIncludedBlock ? { viaConcern: true } : {}),
       });
     }
     return out;
@@ -2605,7 +2790,7 @@ function emitRubySynthesizedMethod(
   edges: RawEdge[],
   minted: Set<string>,
   origin: NodeV1["origin"],
-): void {
+): string {
   const base = `${ctx.rel}#${[...ctx.scope, m.name].join(".")}`;
   const id = mintId(base, minted);
   out.push({
@@ -2639,6 +2824,7 @@ function emitRubySynthesizedMethod(
     };
     for (const child of m.hashNode.namedChildren) walk(child, childCtx, out, edges, minted);
   }
+  return id;
 }
 
 /**

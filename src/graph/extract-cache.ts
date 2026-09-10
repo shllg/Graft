@@ -210,7 +210,13 @@ export function emptyExtractCache(): ExtractCache {
  * build, which is slow but never wrong.
  */
 export function extractInputsKey(rails: { acronyms: ReadonlyMap<string, string> } | null): string {
-  return rails ? `rails:${[...rails.acronyms.keys()].sort().join(",")}` : "plain";
+  if (!rails) return "plain";
+  // Key AND value. `inflect.acronym "API"` and `inflect.acronym "Api"` both key on
+  // `api` and produce different constants — `APIClient` versus `ApiClient` — so a
+  // keys-only identity let an incremental build keep edges resolved under the old
+  // spelling while a cold build produced different ones.
+  const pairs = [...rails.acronyms].map(([k, v]) => `${k}=${v}`).sort();
+  return `rails:${pairs.join(",")}`;
 }
 
 export function readExtractCache(outDir: string, inputs: string): ExtractCache {
