@@ -37,8 +37,17 @@ export type Kind =
  * (`graft build --lsp`) can promote an edge to compiler-grade `lsp_resolved`
  * (an exact server-confirmed target) or `lsp_dispatch` (an interface/virtual
  * candidate). Order matters: consumers that rank by provenance treat earlier
- * values as stronger. */
-export type Confidence = "lsp_resolved" | "lsp_dispatch" | "extracted" | "inferred";
+ * values as stronger.
+ *
+ * `type_bound` is the receiver-typed reading (M3): the target was chosen because
+ * the receiver's TYPE was known — a constant written at the call site, a variable
+ * assigned from one, a declared association reader, or the enclosing class for an
+ * implicit `self` — and the method was then looked up on that class and its own
+ * ancestors. It sits below `extracted` because it reasons across files, and above
+ * `inferred` because `inferred` is a bare-name guess with no receiver behind it:
+ * the whole point of separating them is that a reader (and `graph-quality`) can
+ * see which edges came from a type and which from a name. */
+export type Confidence = "lsp_resolved" | "lsp_dispatch" | "extracted" | "type_bound" | "inferred";
 
 /** Whether the LLM meaning-layer has been computed for a node. */
 export type SummaryState = "pending" | "ready" | "stale";

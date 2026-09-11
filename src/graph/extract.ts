@@ -22,6 +22,7 @@ import { contentHash } from "../util/id.js";
 import { associationConstant } from "./zeitwerk.js";
 import {
   collectBindings,
+  rubyMethodReturnType,
   goReceiverVarOf,
   resolveRecvType,
   cppDeclaratorName,
@@ -132,26 +133,41 @@ export interface RawEdge {
    * self / this / Go receiver), when a confident local clue exists. */
   recvType?: string;
   /** calls without viaMember: which kinds the bare-name match may resolve to.
-   * Every other language's bare-name call is always a free function, so this
-   * is absent for them (resolve.ts defaults to `["function"]`). R (Phase 4) is
-   * the one exception: `obj$method()` with an untyped receiver (not
+   * Most languages' bare-name call is always a free function, so this is absent
+   * for them (resolve.ts defaults to `["function"]`). R (Phase 4) is the
+   * exception that needs it WIDENED: `obj$method()` with an untyped receiver (not
    * self/private/super, which already resolve precisely via viaMember+recvType)
    * still has a real shot at a correct match if the method name happens to be
    * uniquely defined across the repo — R6 methods are kind "method", not
    * "function", so without this override every such call would be
-   * unconditionally unresolvable rather than just occasionally ambiguous. */
+   * unconditionally unresolvable rather than just occasionally ambiguous.
+   *
+   * Ruby sets it to the default explicitly, for the opposite reason: M0 widened it
+   * to "method" so a bare word could reach a sibling or mixed-in method, and M3
+   * reaches those owner-qualified instead. What the widening left behind was a
+   * bare word matching a method on an UNRELATED class, which Ruby's own lookup
+   * cannot do — a receiverless word is `self.word`, and off the ancestry the only
+   * thing it can find is a top-level `def`, kind "function". */
   kinds?: Kind[];
   /** calls: the number of arguments at the CALL SITE. Only emitted for languages
    * with overloading (Java, Swift), where a same-named sibling on the same class is
    * otherwise indistinguishable — and picking wrong turns a delegating overload
    * into a self-loop. */
   argCount?: number;
-  /** Swift only: a bare lowercase call inside a type body, which the language
-   * resolves member-first (inner scope wins). The edge carries the member
-   * reading (viaMember + recvType = the enclosing type); this flag lets
-   * resolve.ts fall back to the free-function reading when the owner chain has
-   * no such member — and ONLY then, so a name defined as both a member and a
-   * free function yields the member edge alone, exactly as Swift dispatches it. */
+  /** A bare call that the language resolves member-first, carried as ONE edge with
+   * two readings: the member reading (Swift's `viaMember` + `recvType`, Ruby's
+   * `rubyRecvBase: "self"` + `rubyOwnerFqn`) is tried first, and this flag lets
+   * resolve.ts fall back to the free-function/bare-name reading when the owner
+   * chain has no such member — and ONLY then, so a name defined as both a member
+   * and a free function yields the member edge alone, exactly as the language
+   * dispatches it. An AMBIGUOUS member set still drops the edge outright; the
+   * fallback is for "no member anywhere", never for "several".
+   *
+   * Swift: a bare lowercase call inside a type body (inner scope wins). Ruby:
+   * every receiverless call inside a class, because Ruby has no free functions —
+   * a top-level `def` is a private method on Object, so `helper` inside a class
+   * really is `self.helper` and only reaches a top-level definition when the
+   * class's own ancestors have nothing by that name. */
   implicitSelf?: boolean;
   /** Ruby only: `Module.nesting` at the reference site, innermost first
    * (`["A::B::C", "A::B", "A"]`). Present on every Ruby `references` edge and on
@@ -190,6 +206,45 @@ export interface RawEdge {
    * concern — declining rather than attributing a callback to a module that never
    * runs it. */
   viaConcern?: boolean;
+  /** Ruby only (M3): where this call's receiver TYPE comes from. Its presence is
+   * what routes the edge through receiver-typed resolution instead of the
+   * bare-name ladder, so a graph built before M3 resolves exactly as it did.
+   *
+   *   - `"self"` — the receiver is the enclosing class, named exactly by
+   *     `rubyOwnerFqn`: an explicit `self.foo`, or a receiverless `foo` (which in
+   *     Ruby IS `self.foo`; there are no free functions).
+   *   - `"const"` — the receiver is a constant written at the call site or a
+   *     variable assigned from one, carried in `rubyRecvConst` and resolved by
+   *     M1's constant resolver against `nesting`.
+   *
+   * A receiver that is neither — a parameter, a rescue binding, `params[:x]`, a
+   * duck-typed service object — sets nothing and emits NO edge at all. That is
+   * the milestone's whole point: `e.message` used to resolve, by unique name, to
+   * a ViewComponent's `attr_reader :message`, 161 times. */
+  rubyRecvBase?: "self" | "const";
+  /** Ruby only (M3): the receiver's class as WRITTEN (`User`, `Api::V1::Job`,
+   * `::Top::Thing`), for `rubyRecvBase === "const"`. Paired with `nesting`, since
+   * what a constant names depends on where it is written. */
+  rubyRecvConst?: string;
+  /** Ruby only (M3): reader calls applied to the base before this call —
+   * `user.subscriptions.active` is base `user`, steps `["subscriptions"]`, name
+   * `active`. Each step is resolved on the running type and must have a DECLARED
+   * return type (an association) for the walk to continue; a step that does not
+   * declines the whole edge rather than resolving `active` against the base. */
+  rubyRecvSteps?: string[];
+  /** Ruby only (M3): this `references` edge's constant is also the RETURN type of
+   * the method with this node id — an association reader (`has_many :posts`
+   * declares that `posts` yields `Post`s) or a method whose every exit agrees on
+   * one class (`current_user`). `resolve.ts` records it so a chained receiver can
+   * be walked one hop at a time. */
+  rubyReturnsFor?: string;
+  /** Ruby only (M3): a carrier, not an edge. It exists to state a type and must
+   * never reach the graph — the same role `rubyConstDecl` plays for shadowing
+   * declarations. An INFERRED return type is not a reference anyone wrote: the
+   * method's own body usually names the class anyway (and M1 emits that edge from
+   * the source text), and where it does not, minting one would put a dependency in
+   * the graph that the file does not contain. */
+  rubyTypeOnly?: boolean;
 }
 
 export interface ExtractResult {
@@ -863,6 +918,24 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
           ? false
           : ctx.rubyIncludedBlock,
     };
+    // M3: a method whose every exit agrees on one class declares its own return
+    // type, which is what lets `current_user.can_delete_account?` resolve — the
+    // reader is hand-written, so no Rails macro states what it yields. A carrier,
+    // never an edge; see `RawEdge.rubyTypeOnly`.
+    if (ctx.lang === "ruby" && (desc.kind === "method" || desc.kind === "function")) {
+      const returns = rubyMethodReturnType(node, ctx.bindings, childCtx.scope);
+      if (returns) {
+        edges.push({
+          source: id,
+          relation: "references",
+          name: returns,
+          file: ctx.rel,
+          nesting: [...ctx.rubyNesting],
+          rubyReturnsFor: id,
+          rubyTypeOnly: true,
+        });
+      }
+    }
     walkNamedChildren(node.namedChildren, childCtx, out, edges, minted);
     return;
   }
@@ -973,7 +1046,21 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
           for (const m of declared) {
             mintedIds.set(m.name, emitRubySynthesizedMethod(m, ctx, out, edges, minted, "synthesized"));
           }
+          const reader = rubyAssociationReader(node);
+          const readerId = reader ? mintedIds.get(reader) : undefined;
+          // M3: the association reader is the one method in a Rails app whose
+          // RETURN type is declared. Tag the constant reference the macro already
+          // emits with the reader's node id rather than minting a second edge for
+          // a fact the first one carries — resolve.ts then knows that calling this
+          // method yields that class, which is what makes `blog.posts.recent`
+          // resolvable at all. A reader the class overrides with a real `def` is
+          // not minted, so it gets no id and no declared type, which is right: a
+          // hand-written `def posts` returns whatever its body returns.
+          if (readerId) {
+            for (const me of macroEdges) if (me.relation === "references") me.rubyReturnsFor = readerId;
+          }
           edges.push(...macroEdges);
+          edges.push(...rubyDelegateForwards(node, ctx, mintedIds));
           // An association extension (`has_many :things do def latest; end end`)
           // carries a block none of the synthesized methods claimed. Rails defines
           // those methods on the association PROXY — `blog.posts.latest` — and not on
@@ -985,8 +1072,6 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
           // every call in its own body.
           const trailing = node.childForFieldName("block");
           if (trailing && !declared.some((m) => sameSyntaxNode(m.hashNode, trailing))) {
-            const reader = rubyAssociationReader(node);
-            const readerId = reader ? mintedIds.get(reader) : undefined;
             const blockCtx: WalkCtx =
               reader && readerId
                 ? { ...ctx, scope: [...ctx.scope, reader], parentId: readerId, enclosingClass: reader }
@@ -1003,7 +1088,7 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
     const consumedCallee = ctx.lang === "r" && node.type === "call" ? rCalleeName(node) : null;
     const isConsumedRClassCall =
       consumedCallee === "R6Class" || (consumedCallee === "list" && rIsMixinContainer(node));
-    const callee = isConsumedRClassCall ? null : calleeName(node, ctx.lang);
+    const callee = isConsumedRClassCall ? null : calleeName(node, ctx);
     if (callee) {
       const callEdge: RawEdge = {
         source: ctx.parentId,
@@ -1047,37 +1132,47 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
           recvType: ctx.enclosingClass!,
           implicitSelf: true,
         });
+      } else if (callee.ruby) {
+        // Ruby (M3): the receiver's type, however it was established, travels as
+        // its own fields — `recvType` is a BARE class name and Ruby resolution is
+        // fully-qualified, which is the distinction M1 and M2 were built on.
+        edges.push({ ...callEdge, ...callee.ruby });
       } else {
         const recvType = callee.recvType ?? resolveRecvType(callee.receiver, ctx);
         edges.push(recvType ? { ...callEdge, recvType } : callEdge);
       }
     }
-  } else if (ctx.lang === "ruby" && node.type === "identifier" && isRubyBareCallCandidate(node)) {
+  } else if (ctx.lang === "ruby" && node.type === "identifier" && rubyBareCallPosition(node, ctx)) {
     // Ruby's optional parens mean a paren-less, argument-less method call
     // (`helper`) is syntactically indistinguishable from a local-variable
     // read — tree-sitter-ruby emits a plain `identifier` for both, unlike
     // `helper(1)` / `helper 1`, which get a real `call` node (see
     // `rubyCallee`'s own doc comment). Per spec ("bare `foo(...)`/`foo`...
-    // resolve by name the same way R's Phase 1 does"), a bare-word standing
-    // alone in statement position (see `isRubyBareCallCandidate`) is a call
-    // candidate — a local variable that's ALSO read that way (its own,
-    // otherwise-unused statement) misfires as an edge here, but it only
-    // resolves if some method/function elsewhere happens to share the name,
-    // same accepted-noise tradeoff as every other untyped bare-name match in
-    // this file. Every other position (assignment RHS, call argument,
-    // return value, operand, interpolation) is deliberately NOT treated as
-    // a call candidate — see `isRubyBareCallCandidate`'s doc comment. Widened
-    // to also match "method" kind nodes for the same reason as rubyCallee's
-    // no-receiver case (see its doc comment) — a paren-less bare word inside
-    // a class body is just as likely to name a sibling method as a
-    // top-level function.
+    // resolve by name the same way R's Phase 1 does"), a bare word in one of the
+    // two positions `rubyBareCallPosition` allows is a call candidate.
+    //
+    // M3 gave this an owner: inside a class the word is `self.<word>`, so it
+    // resolves on that class and its ancestors FIRST and only falls back to the
+    // bare-name ladder when nothing on the chain answers. That is also what makes
+    // the receiver position safe to include — `organization.id` really does call
+    // `attr_reader :organization`, and the two real call sites of filewerk's
+    // `BulkActionsService#organization` are exactly that shape.
+    const own = ctx.rubyNesting[0];
     edges.push({
       source: ctx.parentId,
       relation: "calls",
       name: node.text,
       viaMember: false,
       file: ctx.rel,
-      kinds: ["function", "method"],
+      // `function` only — see rubyCallee's no-receiver branch for why.
+      kinds: ["function"],
+      ...(own ? { rubyRecvBase: "self" as const, rubyOwnerFqn: own } : {}),
+      // A word standing alone as its own statement may still be a top-level
+      // method, so it keeps the bare-name fallback. A word in RECEIVER position
+      // does not: `foo.bar` where the class has no `foo` is a receiver this pass
+      // cannot type, and answering it with whatever unique `foo` exists elsewhere
+      // in the repo is the exact guess M3 exists to stop making.
+      ...(own && node.parent?.type === "body_statement" ? { implicitSelf: true as const } : {}),
     });
   } else if (
     ctx.lang === "ruby" &&
@@ -2267,44 +2362,171 @@ function rubyInlineVisibility(
 }
 
 /**
- * Ruby's `call` node splits the callee into `receiver` + `method` fields
- * (never a single `function` field), so it's intercepted before the shared
- * lookup every other language uses. `self.method` resolves directly to the
- * enclosing class via the already-generic "self" handling in
- * resolveRecvType — no Ruby-specific binding table needed. Every other
- * receiver shape (`obj.method`, `Klass.method`, or no receiver at all) is a
- * bare-name match: there's no type-binding table (see spec Non-goals), so
- * `receiver` is deliberately left unset rather than passed through as an
- * unresolvable string. `super(...)`'s implicit callee (no `method` field at
- * all) returns null — no call edge, matching the "erring toward false
- * negatives" precedent.
+ * The method an `obj.attr` call site actually invokes: `attr=` when it stands on
+ * the left of an assignment, `attr` everywhere else.
+ *
+ * Ruby's assignment syntax hides a method call. `Current.user = current_user` is
+ * `Current.user=(current_user)`, and tree-sitter spells it as an ordinary `call`
+ * node parked in an `assignment`'s `left` field — indistinguishable, at the call
+ * node itself, from the READ two lines further down. Until M3 typed the receiver
+ * both were bare-name matches that resolved to nothing, so the difference never
+ * surfaced; typed, the writer would have landed squarely on the reader's node and
+ * `graft callers user` would have reported every `Current.user = …` in the app as
+ * a caller of a method it never calls.
+ *
+ * An operator assignment (`self.count += 1`) really does call both `count` and
+ * `count=`. Only the writer is emitted, keeping this file's "err toward false
+ * negatives" rule rather than minting a second edge from one call node.
  */
-function rubyCallee(node: Parser.SyntaxNode): { name: string; viaMember: boolean; receiver?: string; kinds?: Kind[] } | null {
+function rubyAssignedMethodName(node: Parser.SyntaxNode, name: string): string {
+  let cur: Parser.SyntaxNode = node;
+  // `a.x, b.y = 1, 2` — each target sits inside the list that IS the left field.
+  if (cur.parent?.type === "left_assignment_list") cur = cur.parent;
+  const parent = cur.parent;
+  if (
+    (parent?.type === "assignment" || parent?.type === "operator_assignment") &&
+    sameSyntaxNode(parent.childForFieldName("left"), cur)
+  ) {
+    return `${name}=`;
+  }
+  return name;
+}
+
+/** How many reader hops a chained receiver may take before the walk gives up.
+ * `a.b.c.d.e` is already past anything a Rails app writes on purpose, and each
+ * hop needs a DECLARED return type to continue, so the cap only bounds a
+ * pathological expression rather than deciding any real one. */
+const RUBY_RECV_CHAIN_CAP = 4;
+
+/** A receiver whose class M3 can name: a base (the enclosing class, or a constant)
+ * plus the reader calls applied to it before the call in question. */
+type RubyReceiver = { base: "self"; steps: string[] } | { base: "const"; constPath: string; steps: string[] };
+
+/**
+ * The class of a Ruby receiver expression, or null when this pass cannot say —
+ * which is the answer for most receivers and is the point of the milestone.
+ *
+ * The four typeable shapes, and why each is safe:
+ *
+ *   - `self` — the enclosing class, named exactly.
+ *   - a constant (`User.find`, `::Api::V1::Job.call`) — the programmer wrote the
+ *     class at the call site; M1 resolves what it names from `nesting`.
+ *   - a variable assigned from a constant (`user = User.find(1)` … `user.save`) —
+ *     `collectBindings` typed it, and withdrew the binding if any other write in
+ *     the same scope disagreed.
+ *   - a receiverless name that is NOT a variable here (`organization.id` inside a
+ *     class declaring `attr_reader :organization`) — Ruby has no free functions,
+ *     so this is `self.organization`, and it becomes a step on the `self` base.
+ *     `bindings.isRubyVar` is what separates it from a parameter of the same name,
+ *     and getting that wrong in either direction is a wrong edge, not a missing
+ *     one.
+ *
+ * Everything else — a literal, an index (`params[:id]`), a ternary, a method call
+ * with no declared return type, an instance variable assigned something unreadable
+ * — is null, and the caller emits no edge at all.
+ */
+function rubyReceiverType(node: Parser.SyntaxNode, ctx: WalkCtx): RubyReceiver | null {
+  if (node.type === "self") return { base: "self", steps: [] };
+  if (node.type === "constant" || node.type === "scope_resolution") {
+    const path = rubyConstPath(node);
+    return path === null ? null : { base: "const", constPath: path, steps: [] };
+  }
+  if (node.type === "identifier") {
+    const bound = ctx.bindings.lookup(ctx.scope, node.text);
+    if (bound) return { base: "const", constPath: bound, steps: [] };
+    // A variable with no knowable type. NOT a call on self — reading it as one
+    // would bind a parameter to a same-named accessor on its own class.
+    if (ctx.bindings.isRubyVar(ctx.scope, node.text)) return null;
+    return { base: "self", steps: [node.text] };
+  }
+  if (node.type === "instance_variable" || node.type === "class_variable" || node.type === "global_variable") {
+    // No `self` fallback here: an instance variable that was never assigned a
+    // typeable value is `nil`, not a method.
+    const bound = ctx.bindings.lookup(ctx.scope, node.text);
+    return bound ? { base: "const", constPath: bound, steps: [] } : null;
+  }
+  if (node.type === "call") {
+    const method = node.childForFieldName("method");
+    if (method?.type !== "identifier") return null;
+    const inner = node.childForFieldName("receiver");
+    const head: RubyReceiver | null = inner
+      ? rubyReceiverType(inner, ctx)
+      : ctx.bindings.isRubyVar(ctx.scope, method.text)
+        ? null
+        : { base: "self", steps: [] };
+    if (!head) return null;
+    if (head.steps.length >= RUBY_RECV_CHAIN_CAP) return null;
+    return { ...head, steps: [...head.steps, method.text] };
+  }
+  return null;
+}
+
+/** The M3 receiver fields for a `RawEdge`, or null when the receiver's class is
+ * unnamed — including the case where it IS `self` but there is no enclosing class
+ * to name (a top-level `def`, where `self` is `main`). */
+function rubyRecvFields(recv: RubyReceiver, ctx: WalkCtx): Partial<RawEdge> | null {
+  const steps = recv.steps.length > 0 ? { rubyRecvSteps: recv.steps } : {};
+  if (recv.base === "self") {
+    const own = ctx.rubyNesting[0];
+    return own ? { rubyRecvBase: "self", rubyOwnerFqn: own, ...steps } : null;
+  }
+  return { rubyRecvBase: "const", rubyRecvConst: recv.constPath, nesting: [...ctx.rubyNesting], ...steps };
+}
+
+/**
+ * Ruby's `call` node splits the callee into `receiver` + `method` fields (never a
+ * single `function` field), so it's intercepted before the shared lookup every
+ * other language uses.
+ *
+ * M3 replaced what used to happen here. Every receiver shape that was not `self`
+ * — `obj.method`, `Klass.method` — resolved by BARE NAME, and on a real Rails app
+ * that was the single largest source of wrong edges in the graph: `e.message`,
+ * `error.message` and `flash[:message]`'s neighbours all landed on the one node in
+ * the repo named `message`, a ViewComponent's `attr_reader`, 161 times. A receiver
+ * is now either typed — and then resolved on that class and its ancestors — or it
+ * emits nothing at all.
+ *
+ * A receiverless call keeps the bare-name reading, but only as a FALLBACK behind
+ * the enclosing class's own chain (`implicitSelf`): Ruby has no free functions, so
+ * `helper` inside a class means `self.helper`, and only means a top-level `def`
+ * when nothing on the class's ancestry answers. The `kinds` widening to "method"
+ * stays for that fallback — a mixed-in module's method is a legitimate target and
+ * `resolveName` cannot otherwise see it.
+ *
+ * `super(...)`'s implicit callee (no `method` field at all) returns null — no call
+ * edge, matching the "erring toward false negatives" precedent.
+ */
+function rubyCallee(
+  node: Parser.SyntaxNode,
+  ctx: WalkCtx,
+): { name: string; viaMember: boolean; kinds?: Kind[]; ruby?: Partial<RawEdge> } | null {
   const methodNode = node.childForFieldName("method");
   if (!methodNode) return null;
+  const name = rubyAssignedMethodName(node, methodNode.text);
   const receiverNode = node.childForFieldName("receiver");
-  if (receiverNode?.type === "self") return { name: methodNode.text, viaMember: true, receiver: "self" };
-  // Phase 4: a receiver present but not `self` (an explicit obj.method(),
-  // Klass.method(), or — with no receiver at all — a bare call inside a
-  // class body) has no type-binding table to resolve against (see spec
-  // Non-goals), so it's a bare-name match widened to also match "method"
-  // kind nodes — the same RawEdge.kinds override R's own Phase 4
-  // introduced, resolve.ts already handles it generically. This is what
-  // makes a mixed-in module's methods reachable: resolveName() doesn't
-  // distinguish "defined directly on this class" from "pulled in via
-  // include" — it just matches by name and kind.
-  if (receiverNode) return { name: methodNode.text, viaMember: false, kinds: ["function", "method"] };
-  // No receiver at all — per this same comment's own enumeration above, a
-  // paren'd/argumented bare call (`helper(1)`) inside a class body needs the
-  // identical "method" widening a non-self receiver gets, for the same
-  // reason (a sibling method, or one pulled in via a mixin, is a legitimate
-  // target and resolveName() can't otherwise see it). Discovered as a real
-  // gap in Phase 5 (a `def`'s bare-call-to-a-sibling-method case had no
-  // working precedent to copy — see rubySynthesizedMethods' define_method
-  // test), not merely theoretical: without this, `def a; helper; end` /
-  // `def a; helper(1); end` inside a class never resolves to `def helper`
-  // defined alongside it.
-  return { name: methodNode.text, viaMember: false, kinds: ["function", "method"] };
+  if (!receiverNode) {
+    // The bare-name fallback is `function` only, and that is Ruby's own rule, not
+    // a tightening for its own sake: a receiverless word is `self.word`, so the
+    // only definitions it can reach are the enclosing class's ancestry — already
+    // tried, owner-qualified, above — and a top-level `def`, which Ruby makes a
+    // private method on Object and this graph records as kind "function". A
+    // "method" on some unrelated class is not reachable that way, and matching one
+    // is how a bare `warn` in a Falcon config file became a call into a rake
+    // task's logger.
+    const own = ctx.rubyNesting[0];
+    if (!own) return { name, viaMember: false, kinds: ["function"] };
+    return {
+      name,
+      viaMember: false,
+      kinds: ["function"],
+      ruby: { rubyRecvBase: "self", rubyOwnerFqn: own, implicitSelf: true },
+    };
+  }
+  const recv = rubyReceiverType(receiverNode, ctx);
+  if (!recv) return null; // the residual: no type, no edge
+  const fields = rubyRecvFields(recv, ctx);
+  if (!fields) return null;
+  return { name, viaMember: true, ruby: fields };
 }
 
 const RUBY_MIXIN_KEYWORDS = new Set(["include", "extend", "prepend"] as const);
@@ -2763,6 +2985,56 @@ function rubyMacroEdges(node: Parser.SyntaxNode, ctx: WalkCtx, classId: string):
   return out;
 }
 
+/**
+ * `delegate :name, :email, to: :user` — the forward, as a call from each generated
+ * method to the one it actually reaches.
+ *
+ * The generated methods themselves are `rubyMacroMethods`' business; this is the
+ * type edge. `Post#user_name` calling `User#name` is exactly the chain M3 resolves
+ * for `post.user.name` written out by hand, so it is spelled the same way: base
+ * `self`, one step through the `to:` reader, then the delegated name. Everything
+ * that makes the chain decline elsewhere declines here too — a `to:` target with
+ * no declared type (`to: :class`, a plain `attr_reader`) simply resolves to
+ * nothing, which is the honest answer for a forward whose destination is unknown.
+ *
+ * A delegated name the class also writes out with a real `def` was never minted,
+ * so it has no id here and gets no edge: the `def` is what runs, and it does not
+ * forward.
+ */
+function rubyDelegateForwards(
+  node: Parser.SyntaxNode,
+  ctx: WalkCtx,
+  mintedIds: ReadonlyMap<string, string>,
+): RawEdge[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "delegate") return [];
+  if (node.childForFieldName("receiver")) return [];
+  const own = ctx.rubyNesting[0];
+  if (!own) return [];
+  const args = node.childForFieldName("arguments");
+  const to = rubyMacroName(args, "to");
+  if (!to) return [];
+  const syms = rubySymbolArgs(args);
+  const local = rubyAffixNames(syms, args, to);
+  if (local === null) return [];
+  const out: RawEdge[] = [];
+  for (let i = 0; i < syms.length; i++) {
+    const id = mintedIds.get(local[i]);
+    if (!id) continue;
+    out.push({
+      source: id,
+      relation: "calls",
+      name: syms[i],
+      file: ctx.rel,
+      viaMember: true,
+      rubyRecvBase: "self",
+      rubyOwnerFqn: own,
+      rubyRecvSteps: [to],
+    });
+  }
+  return out;
+}
+
 /** The `{ ... }` / `do ... end` body of a lambda argument, which is what a `scope`
  * macro's second argument always is. Null when the macro was given something else
  * (a symbol, a method reference), in which case there is no body to descend into. */
@@ -2828,30 +3100,83 @@ function emitRubySynthesizedMethod(
 }
 
 /**
- * Does this bare `identifier` look like a paren-less, standalone method
- * invocation — as opposed to a local-variable/parameter read appearing
- * anywhere an expression is expected (an assignment's right-hand side, a
- * call argument, a `return` value, a binary-operator operand, or a string
- * interpolation)? Restricted to genuine *statement position*: the direct
- * child of a `body_statement` (a method/block body's own statement list).
+ * Does this bare `identifier` invoke a method, as opposed to reading a
+ * local variable or a parameter? Ruby's optional parens make the two
+ * spellings identical, so this is a position question plus a variable question.
  *
- * Confirmed directly against the grammar (not assumed): only a bare
- * identifier standing alone as its own statement — `def caller; helper; end`
- * — has `body_statement` as its immediate parent. Every other position
- * (`self.x = helper`, `foo(helper)`, `return helper`, `helper + 1`,
- * `"#{helper}"`) nests the identifier one level deeper, inside
- * `assignment`/`argument_list`/`return`/`binary`/`interpolation` instead —
- * so this one check is narrower AND simpler than enumerating every
- * exclusion (declaration names, assignment targets, parameters, ...) the
- * earlier version of this function tried to list by hand, and doesn't miss
- * a shape that list-based approach didn't think of. The cost is a
- * false-negative for a call used purely for its return value (`x =
- * helper()`'s paren-less sibling `x = helper` isn't caught) — accepted per
- * this file's usual "erring toward false negatives" precedent for Ruby's
- * genuinely ambiguous bare-word shapes.
+ * Before M3 the answer was one narrow position — a bare word standing alone as its
+ * own statement — and that function's own comment admitted both costs: a local
+ * variable read that way misfired as a call, and every OTHER position was given up
+ * on, because listing them meant listing the declaration positions too and missing
+ * one of those is a wrong edge rather than an absent one.
+ *
+ * M3 supplies the missing half. `bindings.isRubyVar` says which names are variables
+ * here, so the position rule no longer carries that weight alone, and the positions
+ * become an inclusion list of places a value is READ (`RUBY_VALUE_PARENTS`). What
+ * that buys, measured on filewerk-rails: `old_user = user` inside
+ * `Current#with_user` and the three `*_template` reads inside
+ * `UploadZone::Component#filtered_html_options` — an assignment right-hand side and
+ * three hash values, all genuine implicit-self calls M0-M2 could not see. Plus
+ * receiver position, `organization.id`, the shape both real call sites of
+ * `BulkActionsService#organization` take.
+ *
+ * Receiver position in particular is unusable without `isRubyVar`:
+ * `initialize(organization:)` in that same class makes `organization.id` inside
+ * `initialize` a local read, and `e.message` in every rescue clause in the app
+ * would become a call on the enclosing class.
  */
-function isRubyBareCallCandidate(node: Parser.SyntaxNode): boolean {
-  return node.parent?.type === "body_statement";
+function rubyBareCallPosition(node: Parser.SyntaxNode, ctx: WalkCtx): boolean {
+  const parent = node.parent;
+  if (!parent) return false;
+  if (!rubyIsValuePosition(node, parent)) return false;
+  return !ctx.bindings.isRubyVar(ctx.scope, node.text);
+}
+
+/**
+ * Node types whose named children are VALUES being read, never names being
+ * declared. An inclusion list, deliberately, and not the exclusion list the shape
+ * of the problem keeps suggesting: a position missing from this set costs one
+ * edge, while a declaration position missing from an exclusion set would turn
+ * `def foo` and `|foo|` into calls on the enclosing class. Every entry was read
+ * off the grammar with a parse dump, not assumed.
+ *
+ * Notable absentees, each on purpose:
+ *   - `method`/`singleton_method`/`class`/`module` — their `name` child.
+ *   - every `*_parameter` node and the three parameter lists.
+ *   - `in_clause` — Ruby 3 pattern matching BINDS names inside it (`in {name: n}`),
+ *     so nothing under it is a read. Its `case_match` subject is, and that is listed.
+ *   - `alias`/`undef` — both take method names, not values.
+ */
+const RUBY_VALUE_PARENTS: ReadonlySet<string> = new Set([
+  // statement lists: an identifier standing alone as its own statement
+  "body_statement", "block_body", "then", "else", "ensure", "do", "begin",
+  // expressions
+  "argument_list", "right_assignment_list", "binary", "unary", "conditional",
+  "array", "interpolation", "parenthesized_statements", "splat_argument",
+  "block_argument", "hash_splat_argument",
+  // conditions and case subjects
+  "if", "unless", "while", "until", "elsif", "when", "case", "case_match",
+]);
+
+/**
+ * Is this identifier in a position where it reads a value?
+ *
+ * Three parent types need a field check rather than a blanket answer, because
+ * each holds both a name and a value:
+ *   - `assignment`/`operator_assignment` — `left` is a target, `right` is a read.
+ *   - `pair` — the `value` is a read.
+ *   - `call` — the `receiver` is a read (`organization.id` really does call
+ *     `attr_reader :organization`), while the `method` field is the name being
+ *     called and already has its own edge. Reading `user.name`'s `name` as a call
+ *     on the ENCLOSING class would be a confidently wrong edge.
+ */
+function rubyIsValuePosition(node: Parser.SyntaxNode, parent: Parser.SyntaxNode): boolean {
+  if (parent.type === "assignment" || parent.type === "operator_assignment") {
+    return sameSyntaxNode(parent.childForFieldName("right"), node);
+  }
+  if (parent.type === "pair") return sameSyntaxNode(parent.childForFieldName("value"), node);
+  if (parent.type === "call") return sameSyntaxNode(parent.childForFieldName("receiver"), node);
+  return RUBY_VALUE_PARENTS.has(parent.type);
 }
 
 /** Java definition shapes. Uniform in a way Go's are not: every declaration carries
@@ -3477,9 +3802,13 @@ function javaTypeParameterNames(decl: Parser.SyntaxNode): ReadonlySet<string> {
 
 function calleeName(
   node: Parser.SyntaxNode,
-  lang: Language,
-): { name: string; viaMember: boolean; receiver?: string; recvType?: string; kinds?: Kind[] } | null {
-  if (lang === "ruby") return rubyCallee(node);
+  ctx: WalkCtx,
+): { name: string; viaMember: boolean; receiver?: string; recvType?: string; kinds?: Kind[]; ruby?: Partial<RawEdge> } | null {
+  const lang = ctx.lang;
+  // Ruby is the one language whose callee needs the walk state: M3 types a
+  // receiver from the file's binding table and from `Module.nesting`, neither of
+  // which is readable off the call node alone.
+  if (lang === "ruby") return rubyCallee(node, ctx);
   // Java first: `method_invocation` has NO `function` field (it splits the callee
   // into `object` + `name`), so the shared lookup below would return null for every
   // Java call site and the language would extract nodes with no call edges at all.

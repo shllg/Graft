@@ -17,6 +17,18 @@ import type { Language, WalkCtx } from "./extract.js";
  * lexical position. */
 export class FileBindings {
   private map = new Map<string, string>();
+  /** Ruby (M3): every name that is a VARIABLE in this scope — a local, a
+   * parameter, a block parameter, a rescue binding, an instance/class variable.
+   * Ruby spells a receiverless method call exactly like a variable read, so
+   * without this a `def go; organization.id; end` inside a class that also takes
+   * an `organization:` parameter reads the parameter as a call to the class's own
+   * `attr_reader :organization`. Tracked separately from `map` because a variable
+   * with no knowable type still has to be recognized AS a variable. */
+  private rubyVars = new Set<string>();
+  /** Ruby (M3): assignment types, pending the agreement check in `finalizeRuby`.
+   * `null` means "assigned something this pass cannot type", which is a
+   * disagreement like any other. */
+  private rubyAssigned = new Map<string, string | null>();
 
   set(scopePath: string, name: string, type: string): void {
     this.map.set(`${scopePath}|${name}`, type);
@@ -29,6 +41,38 @@ export class FileBindings {
       if (hit) return hit;
     }
     return null;
+  }
+
+  /** Ruby (M3): note that `name` is a variable in this scope, and what (if
+   * anything) it was assigned. Call with `type = null` for a declaration that
+   * carries no type at all (a parameter, a rescue binding) as well as for an
+   * assignment whose right-hand side cannot be typed — both are the same fact:
+   * this name holds a value we cannot name. */
+  noteRubyVar(scopePath: string, name: string, type: string | null): void {
+    const key = `${scopePath}|${name}`;
+    this.rubyVars.add(key);
+    if (!this.rubyAssigned.has(key)) this.rubyAssigned.set(key, type);
+    else if (this.rubyAssigned.get(key) !== type) this.rubyAssigned.set(key, null);
+  }
+
+  /** Ruby (M3): promote the assignments that every writer agreed on into the
+   * ordinary binding table. A name written twice with two different classes — or
+   * once with a class and once with anything unreadable — reaches `lookup` as
+   * nothing, because a receiver that holds two types over one scope cannot be
+   * bound to either without picking one at random. Order-independent: the
+   * disagreement poisons the entry whichever assignment the walk saw first. */
+  finalizeRuby(): void {
+    for (const [key, type] of this.rubyAssigned) if (type) this.map.set(key, type);
+  }
+
+  /** Ruby (M3): is `name` a variable at this point? Innermost-first, exactly like
+   * `lookup`, so a parameter declared in one method never silences a reader call
+   * of the same name in its sibling. */
+  isRubyVar(scope: string[], name: string): boolean {
+    for (let i = scope.length; i >= 0; i--) {
+      if (this.rubyVars.has(`${scope.slice(0, i).join(".")}|${name}`)) return true;
+    }
+    return false;
   }
 }
 
@@ -71,11 +115,7 @@ export function defName(node: Parser.SyntaxNode, lang: Language): string | null 
     return null;
   }
   if (lang === "r") return rDefName(node);
-  if (lang === "ruby") {
-    const rubyDefTypes = new Set(["class", "module", "method", "singleton_method"]);
-    if (rubyDefTypes.has(node.type)) return node.childForFieldName("name")?.text ?? null;
-    return null;
-  }
+  if (lang === "ruby") return rubyDefName(node);
   if (lang === "swift") return swiftDefName(node);
   if (lang === "php") {
     const phpDefTypes = new Set([
@@ -114,6 +154,338 @@ export function defName(node: Parser.SyntaxNode, lang: Language): string | null 
   }
   return null;
 }
+
+/** The scope segment a Ruby definition pushes, mirroring extract.ts's
+ * `describeRuby` — duplicated, not imported, per this file's
+ * no-value-import-of-extract rule.
+ *
+ * The compact form is the whole reason this needs its own function. `class
+ * A::B::C` names itself with a `scope_resolution`, and extract.ts pushes that path
+ * DOTTED (`A.B.C`) as ONE scope segment so the id matches the nested spelling's.
+ * Taking `name.text` instead yields `A::B::C`, and a binding filed under a scope
+ * key extract.ts's walk never forms can never be looked up — silently, with no
+ * error anywhere. */
+function rubyDefName(node: Parser.SyntaxNode): string | null {
+  if (node.type === "method" || node.type === "singleton_method") {
+    return node.childForFieldName("name")?.text ?? null;
+  }
+  if (node.type !== "class" && node.type !== "module") return null;
+  const nameNode = node.childForFieldName("name");
+  const path = nameNode ? rubyConstPath(nameNode) : null;
+  return path === null ? null : path.replace(/^::/, "").split("::").join(".");
+}
+
+/** A Ruby constant path as written (`Runner`, `A::B::Runner`, `::Runner`), or null
+ * when any segment of it is a runtime value (`obj::CONST`). Mirrors extract.ts's
+ * function of the same name — see the note on `rubyDefName` for why it is copied
+ * rather than imported. */
+function rubyConstPath(node: Parser.SyntaxNode): string | null {
+  if (node.type === "constant") return node.text;
+  if (node.type !== "scope_resolution") return null;
+  const name = node.childForFieldName("name");
+  if (name?.type !== "constant") return null;
+  const scope = node.childForFieldName("scope");
+  if (!scope) return `::${name.text}`;
+  const head = rubyConstPath(scope);
+  return head === null ? null : `${head}::${name.text}`;
+}
+
+/**
+ * The class methods whose result is an instance of the receiver constant.
+ *
+ * Deliberately a closed list of the constructors and single-record finders, not
+ * "any class method": `User.where(...)` is a relation and `User.pluck(:id)` is an
+ * array, and typing either as `User` would bind `.map`/`.size` to whatever the
+ * model happens to define. `new` is plain Ruby; the rest are ActiveRecord's, and
+ * the ones that raise (`find`, `find_by!`) sit beside the ones that return nil
+ * because a nil-returning finder still names the class it would have returned.
+ *
+ * A relation-returning call is not merely omitted — it produces NO binding, so the
+ * variable is recorded as an untypeable local and every later call on it declines.
+ * That is the intended answer, not a gap: `docs = Document.where(...)` followed by
+ * `docs.first.title` is a chain this pass genuinely cannot follow.
+ */
+const RUBY_INSTANCE_RETURNING: ReadonlySet<string> = new Set([
+  "new",
+  "find",
+  "find!",
+  "find_by",
+  "find_by!",
+  "find_or_create_by",
+  "find_or_create_by!",
+  "find_or_initialize_by",
+  "create",
+  "create!",
+  "first",
+  "first!",
+  "last",
+  "last!",
+  "take",
+  "take!",
+  "build",
+  "instance",
+]);
+
+/** Statement-list nodes whose VALUE is the value of their last statement. */
+const RUBY_TAIL_VALUED: ReadonlySet<string> = new Set([
+  "body_statement", "begin", "then", "else", "do", "parenthesized_statements", "block_body",
+]);
+
+/** Branching expressions: their value is whichever branch ran, so they have a type
+ * only when every branch agrees on one. */
+const RUBY_BRANCHING: ReadonlySet<string> = new Set(["if", "unless", "case", "case_match", "conditional"]);
+
+/** The last statement of a statement list — the one whose value the list takes.
+ * `rescue`/`ensure`/`else` clauses trail the body in the tree but are not its
+ * tail, so they are skipped rather than mistaken for the result. */
+function rubyTailStatement(node: Parser.SyntaxNode): Parser.SyntaxNode | null {
+  for (let i = node.namedChildren.length - 1; i >= 0; i--) {
+    const c = node.namedChildren[i];
+    if (c.type === "rescue" || c.type === "ensure" || c.type === "else" || c.type === "elsif") continue;
+    return c;
+  }
+  return null;
+}
+
+/**
+ * The class a Ruby expression evaluates to, or null when this pass cannot say.
+ *
+ * The base cases say so outright: a constant (`x = User` — the class object
+ * itself, which the owner-qualified index does not distinguish from an instance,
+ * since `def self.foo` and `def foo` are both filed under `User#foo`), or a
+ * constructor/finder call on one.
+ *
+ * The recursive cases exist because real Rails code rarely writes the base case
+ * on its own line. `@current_user = if session[:impersonating_user_id] …
+ * User.find_by(…) elsif … User.find_by(…) end` is the actual shape of
+ * `current_user` in filewerk-rails, and it is the receiver of 90 call sites.
+ * A branch has a type only when EVERY branch that produces one agrees; a branch
+ * producing `nil` is ignored (that is what a finder returns when it finds
+ * nothing, and it does not make the method return a different class), and a
+ * branch this pass cannot read at all withdraws the answer entirely.
+ *
+ * `bindings` and `scope`, when given, let a variable read carry its own binding
+ * through — `return @current_user` is typed by the assignment further down.
+ * Omitted during the binding pass itself, where the table is still being built.
+ */
+function rubyExprType(
+  node: Parser.SyntaxNode,
+  bindings?: FileBindings,
+  scope?: string[],
+  depth = 0,
+): string | null {
+  if (depth > 8) return null;
+  const recur = (n: Parser.SyntaxNode): string | null => rubyExprType(n, bindings, scope, depth + 1);
+  if (node.type === "constant" || node.type === "scope_resolution") return rubyConstPath(node);
+  if (node.type === "assignment" || node.type === "operator_assignment") {
+    const right = node.childForFieldName("right");
+    return right ? recur(right) : null;
+  }
+  if (RUBY_TAIL_VALUED.has(node.type)) {
+    const tail = rubyTailStatement(node);
+    return tail ? recur(tail) : null;
+  }
+  if (RUBY_BRANCHING.has(node.type)) return rubyBranchType(node, recur);
+  if (bindings && scope && (node.type === "identifier" || node.type === "instance_variable" || node.type === "class_variable")) {
+    return bindings.lookup(scope, node.text);
+  }
+  if (node.type !== "call") return null;
+  const method = node.childForFieldName("method");
+  const receiver = node.childForFieldName("receiver");
+  if (!receiver || method?.type !== "identifier") return null;
+  if (!RUBY_INSTANCE_RETURNING.has(method.text)) return null;
+  if (receiver.type !== "constant" && receiver.type !== "scope_resolution") return null;
+  return rubyConstPath(receiver);
+}
+
+/** The one class every branch of a conditional agrees on, or null. `nil` branches
+ * (including an absent `else`, which is an implicit `nil`) abstain rather than
+ * veto; anything else this pass cannot type vetoes. */
+function rubyBranchType(
+  node: Parser.SyntaxNode,
+  recur: (n: Parser.SyntaxNode) => string | null,
+): string | null {
+  const arms: Parser.SyntaxNode[] = [];
+  const collect = (n: Parser.SyntaxNode): void => {
+    for (const c of n.namedChildren) {
+      if (c.type === "then" || c.type === "else") arms.push(c);
+      else if (c.type === "elsif" || c.type === "when" || c.type === "in_clause") collect(c);
+    }
+  };
+  if (node.type === "conditional") {
+    // `c ? a : b` — three bare children, the condition first.
+    arms.push(...node.namedChildren.slice(1));
+  } else {
+    collect(node);
+  }
+  let agreed: string | null = null;
+  for (const arm of arms) {
+    if (arm.namedChildren.length === 0) continue; // an empty branch is nil
+    if (arm.type === "then" || arm.type === "else") {
+      const tail = rubyTailStatement(arm);
+      if (!tail) continue;
+      if (tail.type === "nil") continue;
+      const t = recur(tail);
+      if (!t) return null;
+      if (agreed && agreed !== t) return null;
+      agreed = t;
+      continue;
+    }
+    if (arm.type === "nil") continue;
+    const t = recur(arm);
+    if (!t) return null;
+    if (agreed && agreed !== t) return null;
+    agreed = t;
+  }
+  return agreed;
+}
+
+/**
+ * The class a Ruby method returns, when every exit agrees on one — or null, which
+ * is the answer for the overwhelming majority of methods.
+ *
+ * This is the one type source M3 needs that no declaration provides. Rails states
+ * an association's result (`has_many :posts`), but `current_user`,
+ * `current_organization` and every hand-rolled memoized reader state nothing, and
+ * between them they are the receiver of 126 call sites in filewerk-rails alone —
+ * more than the `message` hotspot this milestone was measured against.
+ *
+ * Every exit means every `return` plus the body's tail expression. A `return` with
+ * no value, and a `nil` literal, abstain — `return nil unless x` does not make the
+ * method return something other than a class. One exit this pass cannot read
+ * withdraws the whole answer: a method that sometimes returns a `User` and
+ * sometimes something unknown is not a `User`-returning method, and binding a
+ * chain through it would be a guess with a class name attached to it.
+ *
+ * `return` inside a `lambda`/`->` returns from the lambda, not the method, so
+ * those are not exits; a nested `def` is not this method's body at all.
+ */
+export function rubyMethodReturnType(
+  node: Parser.SyntaxNode,
+  bindings: FileBindings,
+  scope: string[],
+): string | null {
+  const body = node.childForFieldName("body");
+  if (!body) return null;
+  let agreed: string | null = null;
+  const consider = (n: Parser.SyntaxNode | null): boolean => {
+    if (!n || n.type === "nil") return true;
+    const t = rubyExprType(n, bindings, scope);
+    if (!t) return false;
+    if (agreed && agreed !== t) return false;
+    agreed = t;
+    return true;
+  };
+  let ok = true;
+  const visitReturns = (n: Parser.SyntaxNode): void => {
+    if (!ok) return;
+    if (n.type === "method" || n.type === "singleton_method" || n.type === "lambda" || n.type === "class" || n.type === "module") return;
+    if (n.type === "return") {
+      const args = n.namedChildren[0];
+      if (!args) return; // bare `return` is nil
+      if (args.type === "argument_list" && args.namedChildren.length !== 1) { ok = false; return; }
+      ok = consider(args.type === "argument_list" ? args.namedChildren[0] : args);
+      return;
+    }
+    for (const c of n.namedChildren) visitReturns(c);
+  };
+  for (const c of body.namedChildren) visitReturns(c);
+  if (!ok) return null;
+  const tail = rubyTailStatement(body);
+  if (tail && tail.type !== "nil" && !consider(tail)) return null;
+  return agreed;
+}
+
+/**
+ * Ruby (M3) variable/field -> class bindings, plus the variable NAMES themselves.
+ *
+ * Two outputs, and the second matters as much as the first. Ruby has no syntax
+ * that distinguishes `organization` the local from `organization` the
+ * receiverless call to `attr_reader :organization` — tree-sitter emits a plain
+ * `identifier` for both — so the set of names that are variables here is what
+ * stops a parameter from being read as a call into its own class. It is the
+ * reason the pass records untypeable assignments at all.
+ *
+ * Instance and class variables are filed at the enclosing class's scope, not the
+ * method's: `@user` assigned in `initialize` is the same slot every other method
+ * reads, and filing it per-method would both lose the binding and hide a
+ * disagreement between two methods that assign it differently.
+ */
+function handleRuby(
+  node: Parser.SyntaxNode,
+  scope: string[],
+  classScope: string | null,
+  bindings: FileBindings,
+): void {
+  const scopePath = scope.join(".");
+  const declare = (target: Parser.SyntaxNode, type: string | null): void => {
+    if (target.type === "destructured_parameter" || target.type === "left_assignment_list") {
+      for (const child of target.namedChildren) declare(child, null);
+      return;
+    }
+    const kind = target.type;
+    if (kind !== "identifier" && kind !== "instance_variable" && kind !== "class_variable" && kind !== "global_variable") {
+      return;
+    }
+    const at = kind === "identifier" ? scopePath : (classScope ?? scopePath);
+    bindings.noteRubyVar(at, target.text, type);
+  };
+
+  if (node.type === "assignment" || node.type === "operator_assignment") {
+    const left = node.childForFieldName("left");
+    const right = node.childForFieldName("right");
+    if (!left) return;
+    // A destructuring assignment hands no target an expression of its own, so
+    // every name in it is recorded as untypeable rather than given the whole
+    // right-hand side's type.
+    if (left.type === "left_assignment_list") {
+      declare(left, null);
+      return;
+    }
+    declare(left, right ? rubyExprType(right) : null);
+    return;
+  }
+  if (node.type === "method_parameters" || node.type === "block_parameters" || node.type === "lambda_parameters") {
+    for (const p of node.namedChildren) {
+      declare(p.type === "identifier" || p.type === "destructured_parameter" ? p : (p.childForFieldName("name") ?? p), null);
+    }
+    return;
+  }
+  // `rescue Foo => e` — `e` is a local for the rest of the clause, and it is the
+  // single most common untypeable receiver in a Rails app (`e.message`).
+  if (node.type === "exception_variable") {
+    const first = node.namedChildren[0];
+    if (first) declare(first, null);
+    return;
+  }
+  // `for x in list` — the only Ruby loop that introduces a name without an
+  // assignment or a parameter list.
+  if (node.type === "for") {
+    const first = node.namedChildren[0];
+    if (first) declare(first, null);
+    return;
+  }
+  // Ruby 3 pattern matching binds names too: `in {user: User => u}` makes `u` a
+  // local, and `u.name` would otherwise read as a call on the enclosing class
+  // through the receiver position extract.ts now accepts. Every identifier
+  // directly under a pattern node is a binding — over-approximating here costs at
+  // most a missed edge, while under-approximating costs a wrong one.
+  if (RUBY_PATTERN_NODES.has(node.type)) {
+    for (const child of node.namedChildren) if (child.type === "identifier") declare(child, null);
+    const named = node.childForFieldName("name");
+    if (named?.type === "identifier") declare(named, null);
+  }
+}
+
+/** Ruby 3 `case/in` pattern nodes, whose bare identifiers are BINDINGS. */
+const RUBY_PATTERN_NODES: ReadonlySet<string> = new Set([
+  "array_pattern",
+  "find_pattern",
+  "hash_pattern",
+  "keyword_pattern",
+  "as_pattern",
+  "alternative_pattern",
+]);
 
 /** The scope segment a Swift definition pushes, mirroring extract.ts's
  * `describeSwift` (duplicated, not imported, per this file's
@@ -315,6 +687,9 @@ function isClassNode(node: Parser.SyntaxNode, lang: Language): boolean {
   if (lang === "swift") {
     return node.type === "class_declaration" || node.type === "protocol_declaration";
   }
+  // Ruby: a module owns instance variables exactly as a class does — it is mixed
+  // into something that has them — so both open the scope `@ivar` is filed at.
+  if (lang === "ruby") return node.type === "class" || node.type === "module";
   return false;
 }
 
@@ -345,6 +720,10 @@ export function collectBindings(root: Parser.SyntaxNode, lang: Language): FileBi
   const aliases = new Map<string, string>();
   collectAliases(root, lang, aliases);
   visit(root, lang, [], null, bindings, aliases);
+  // Ruby's bindings are agreed on across the whole file, not at the point of
+  // assignment — a second, contradicting write anywhere in the same scope has to
+  // be able to withdraw the first one. See `FileBindings.finalizeRuby`.
+  if (lang === "ruby") bindings.finalizeRuby();
   return bindings;
 }
 
@@ -385,10 +764,7 @@ function visit(
   // directly via ctx.enclosingClass/ctx.rSuperClass instead (see extract.ts's
   // calleeName R branch) — so no handleR is needed here.
   else if (lang === "r") void 0;
-  // Ruby has no receiver-type binding table by design (see spec Non-goals) —
-  // self.method resolves directly via ctx.enclosingClass, and every other
-  // member call is a bare-name match. No handleRuby needed.
-  else if (lang === "ruby") void 0;
+  else if (lang === "ruby") handleRuby(node, scope, classScope, bindings);
   else if (lang === "java") handleJava(node, scope, classScope, bindings);
   else if (lang === "swift") handleSwift(node, scope, classScope, bindings);
   else if (lang === "php") handlePhp(node, scope, bindings);

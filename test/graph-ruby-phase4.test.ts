@@ -115,12 +115,18 @@ end
   }
 });
 
-test("ruby Phase 4: a mixed-in module's method is reachable from an untyped member call", async () => {
-  // The real point of Phase 4: Loud#shout is defined only inside the
-  // module, never on Widget directly, yet an untyped `w.shout` still
-  // resolves — bare-name resolution doesn't distinguish "defined directly
-  // on this class" from "pulled in via include" once kinds widens to
-  // include "method".
+test("ruby Phase 4/M3: a mixin's method is reachable from a TYPED receiver, and only from one", async () => {
+  // Phase 4 made `Loud#shout` reachable from `w.shout` by matching the bare name
+  // across the repo, because `w` had no type. M3 removed that: the same expression
+  // is now two different questions depending on whether anything says what `w` is.
+  //
+  // `made` is assigned from `Widget.new`, so the receiver's class is known and the
+  // ancestor walk finds a method the class never defines directly — which was
+  // Phase 4's actual point and still holds.
+  //
+  // `w` is a bare parameter. Nothing in the file says what it is, and answering
+  // anyway is what put 161 `e.message` calls onto a ViewComponent's `attr_reader`
+  // (see rubyCallee). No type, no edge.
   const src = `
 module Loud
   def shout; end
@@ -131,18 +137,24 @@ class Widget
 end
 
 class Caller
-  def use(w)
+  def typed
+    made = Widget.new
+    made.shout
+  end
+
+  def untyped(w)
     w.shout
   end
 end
 `;
   const { dir, graph } = await buildAndRead({ "widget.rb": src });
   try {
-    assert.ok(
-      graph.edges.some(
-        (e) => e.relation === "calls" && e.source === "widget.rb#Caller.use" && e.target === "widget.rb#Loud.shout",
-      ),
+    const shout = graph.edges.filter((e) => e.relation === "calls" && e.target === "widget.rb#Loud.shout");
+    assert.deepEqual(
+      shout.map((e) => e.source),
+      ["widget.rb#Caller.typed"],
     );
+    assert.equal(shout[0].confidence, "type_bound");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

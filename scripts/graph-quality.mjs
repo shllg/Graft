@@ -18,7 +18,7 @@ import { join } from "node:path";
 
 const KINDS = new Set(["file","class","function","method","interface","type","enum","struct","module","constant","variable"]);
 const RELATIONS = new Set(["contains","calls","imports","references","implements","extends"]);
-const CONFIDENCE = new Set(["lsp_resolved","lsp_dispatch","extracted","inferred"]);
+const CONFIDENCE = new Set(["lsp_resolved","lsp_dispatch","extracted","type_bound","inferred"]);
 
 const arg = process.argv[2] ?? ".";
 const json = process.argv.includes("--json");

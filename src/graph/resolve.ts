@@ -253,6 +253,25 @@ export function resolveEdges(
     ]);
   }
 
+  // M3: declared RETURN types, keyed by the method node whose call yields them.
+  // Only Rails' association macros declare one — `has_many :posts` says that
+  // calling `posts` gives you `Post`s — and that single fact is what turns
+  // `blog.posts.recent` from an untypeable chain into two ordinary owner-qualified
+  // lookups. Keyed by node id rather than by `Owner#name` so an association
+  // declared in an `ActiveSupport::Concern` still answers for every class that
+  // includes it: the ancestor walk finds the concern's own reader node, which is
+  // the id recorded here.
+  //
+  // Runs after `rubyAncestors` because naming the target class is itself a
+  // constant lookup, and that lookup walks ancestors.
+  const rubyReturns = new Map<string, string>();
+  for (const e of rawEdges) {
+    if (!e.rubyReturnsFor || !e.name || !e.nesting) continue;
+    const hit = resolveRubyConstant(e.name, e.nesting, e.file, rubyFqn, rubyAncestors, rubyShadow, zeitwerk, true);
+    const target = hit ? rubyFqnOf(hit.id) : null;
+    if (target) rubyReturns.set(e.rubyReturnsFor, target);
+  }
+
   // classParents: class/interface name → its declared base-class names, from raw
   // `extends` edges (source id's own name → the base name). Used to walk up an
   // inheritance chain when a receiver's own type has no matching method.
@@ -311,6 +330,9 @@ export function resolveEdges(
   };
 
   for (const e of rawEdges) {
+    // A type carrier states a fact for the pre-passes above and is not a
+    // dependency the source file contains. See `RawEdge.rubyTypeOnly`.
+    if (e.rubyTypeOnly) continue;
     if (e.relation === "contains" && e.targetId) {
       add(e.source, e.targetId, "contains", "extracted");
     } else if (e.relation === "imports" && e.specifier) {
@@ -437,7 +459,26 @@ export function resolveEdges(
         if (hit && hit.id !== e.source) add(e.source, hit.id, "references", hit.confidence);
       }
     } else if (e.relation === "calls") {
-      if (e.viaConcern || e.rubyOwnerFqn) {
+      if (e.rubyRecvBase) {
+        // M3: the receiver's type is known, so the method is looked up on that
+        // class and its own Ruby ancestors — never by name across the repo.
+        const hit = resolveRubyTypedCall(e, rubyOwnerMethod, rubyAncestors, rubyReturns, rubyFqn, rubyShadow, zeitwerk);
+        if (hit === "ambiguous") continue; // several owners, none decidable — drop
+        if (hit) {
+          if (hit.id !== e.source) add(e.source, hit.id, "calls", "type_bound");
+          continue;
+        }
+        // Nothing anywhere on the chain. A receiverless word may still be a
+        // top-level method, so it falls through to the bare-name ladder below;
+        // anything with an explicit receiver stops here, because "this class has
+        // no such method" is an answer, not an invitation to guess.
+        if (!e.implicitSelf) continue;
+      }
+      // `rubyRecvBase` excluded deliberately: an M3 call edge carries
+      // `rubyOwnerFqn` too, and without this it would re-enter the macro path and
+      // run the same owner-qualified lookup that just failed — swallowing the
+      // bare-name fallback an `implicitSelf` edge is entitled to.
+      if (!e.rubyRecvBase && (e.viaConcern || e.rubyOwnerFqn)) {
         // A Rails macro states its receiver exactly — the class it is written in, or,
         // inside an `ActiveSupport::Concern`'s `included do`, each class that INCLUDES
         // the concern. Either way the subject is a known class node, so this resolves
@@ -572,6 +613,7 @@ function pickRubyConstant(
   file: string,
   fqn: string,
   zeitwerk: ZeitwerkMap | null,
+  want: "node" | "fqn" = "node",
 ): { id: string; confidence: EdgeV1["confidence"] } | "ambiguous" | null {
   if (!candidates || candidates.length === 0) return null;
   if (candidates.length === 1) {
@@ -590,6 +632,16 @@ function pickRubyConstant(
     const homed = candidates.filter((c) => isAutoloadHome(zeitwerk, c.path, fqn));
     if (homed.length === 1) return { id: homed[0].id, confidence: "inferred" };
   }
+  // A caller that only wants the CONSTANT PATH is not choosing between these at
+  // all: this index is keyed by fully-qualified name, so every candidate answers
+  // that question with the same string. `module Tenancy` in `lib/tenancy.rb` and
+  // the `module Tenancy` that `app/models/concerns/tenancy/scoped.rb` opens are
+  // one reopened constant in Ruby, and a receiver typed as `Tenancy` then finds
+  // `Tenancy.cross_workspace` in the FQN-keyed method index wherever it was
+  // written. Declining here cost 144 edges on dailywerk that the source states
+  // outright. Pointing an `references` EDGE at one of them is a different
+  // question, and that one still declines.
+  if (want === "fqn") return { id: candidates[0].id, confidence: "inferred" };
   return "ambiguous";
 }
 
@@ -627,6 +679,7 @@ function resolveRubyConstant(
   shadow: ReadonlySet<string>,
   zeitwerk: ZeitwerkMap | null,
   useAncestors: boolean,
+  want: "node" | "fqn" = "node",
 ): { id: string; confidence: EdgeV1["confidence"] } | null {
   const absolute = ref.startsWith("::");
   const bare = absolute ? ref.slice(2) : ref;
@@ -641,7 +694,7 @@ function resolveRubyConstant(
 
   /** One lookup at one fully-qualified name, honouring shadowing declarations. */
   const at = (fqn: string): { id: string; confidence: EdgeV1["confidence"] } | "ambiguous" | null => {
-    const hit = pickRubyConstant(fqnIndex.get(fqn), file, fqn, zeitwerk);
+    const hit = pickRubyConstant(fqnIndex.get(fqn), file, fqn, zeitwerk, want);
     if (hit) return hit;
     // `X = 123` here means Ruby's search ends here. There is no node to name, so
     // the honest answer is no edge — never the outer constant Ruby would not reach.
@@ -744,11 +797,68 @@ function resolveRubyOwnerMethod(
     const cands = index.get(`${scope}#${name}`);
     if (!cands || cands.length === 0) continue;
     const sameFile = cands.filter((c) => c.path === file);
-    if (sameFile.length === 1) return { id: sameFile[0].id, confidence: "extracted" };
-    if (cands.length === 1) return { id: cands[0].id, confidence: "inferred" };
+    // `type_bound` either way (M3). Both readings came from a KNOWN receiver
+    // class, and the same-file/cross-file split that separates `extracted` from
+    // `inferred` elsewhere describes how a NAME was matched — a distinction that
+    // says nothing here, where the owner was never in doubt. Labelling them
+    // separately is the point: it is how `graph-quality` can say how much of the
+    // graph the type table produced.
+    if (sameFile.length === 1) return { id: sameFile[0].id, confidence: "type_bound" };
+    if (cands.length === 1) return { id: cands[0].id, confidence: "type_bound" };
     return "ambiguous";
   }
   return null;
+}
+
+/**
+ * A Ruby call whose receiver type M3 established, resolved on that class.
+ *
+ * Three moves, and each one declines rather than widening:
+ *
+ *   1. The base — the enclosing class named exactly (`self`, a receiverless word,
+ *      a callback), or a constant resolved by M1 against the nesting chain it was
+ *      written in.
+ *   2. Each reader step — `user.subscriptions.active` walks `subscriptions` first.
+ *      A step resolves like any other member call, and then must have a DECLARED
+ *      return type (`rubyReturns`) for the walk to continue. A hand-written method
+ *      has none, so the chain stops there and the call resolves to nothing; that
+ *      is the correct answer, not a gap, because the alternative is to look
+ *      `active` up on `User` — a different class than the one the code names.
+ *   3. The call itself, owner-qualified on whatever the walk arrived at.
+ *
+ * `"ambiguous"` propagates out of a step: two classes could own it and picking one
+ * is exactly the guess this milestone removes.
+ */
+function resolveRubyTypedCall(
+  e: RawEdge,
+  ownerIndex: Map<string, NodeV1[]>,
+  ancestors: Map<string, string[]>,
+  returns: ReadonlyMap<string, string>,
+  fqnIndex: Map<string, NodeV1[]>,
+  shadow: ReadonlySet<string>,
+  zeitwerk: ZeitwerkMap | null,
+): { id: string; confidence: EdgeV1["confidence"] } | "ambiguous" | null {
+  let cur: string | null;
+  if (e.rubyRecvBase === "self") {
+    cur = e.rubyOwnerFqn ?? null;
+  } else {
+    if (!e.rubyRecvConst) return null;
+    // `"fqn"`: this lookup wants the receiver's CONSTANT PATH, not a node to point
+    // an edge at, and several files opening one constant do not disagree about
+    // that. See `pickRubyConstant`.
+    const hit = resolveRubyConstant(e.rubyRecvConst, e.nesting ?? [], e.file, fqnIndex, ancestors, shadow, zeitwerk, true, "fqn");
+    cur = hit ? rubyFqnOf(hit.id) : null;
+  }
+  if (!cur) return null; // the receiver names a gem, stdlib, or nothing in the repo
+  for (const step of e.rubyRecvSteps ?? []) {
+    const hop = resolveRubyOwnerMethod(cur, step, e.file, ownerIndex, ancestors);
+    if (hop === "ambiguous") return "ambiguous";
+    if (!hop) return null;
+    const next = returns.get(hop.id);
+    if (!next) return null; // the step exists but does not declare what it returns
+    cur = next;
+  }
+  return resolveRubyOwnerMethod(cur, e.name!, e.file, ownerIndex, ancestors);
 }
 
 /**
