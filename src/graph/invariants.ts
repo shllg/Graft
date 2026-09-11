@@ -28,10 +28,10 @@ const KINDS = new Set<string>([
   "type", "enum", "struct", "module", "constant", "variable",
 ]);
 const RELATIONS = new Set<string>([
-  "contains", "calls", "imports", "references", "implements", "extends",
+  "contains", "calls", "imports", "references", "implements", "extends", "renders",
 ]);
 const CONFIDENCE = new Set<string>([
-  "lsp_resolved", "lsp_dispatch", "extracted", "type_bound", "inferred",
+  "lsp_resolved", "lsp_dispatch", "extracted", "type_bound", "convention", "inferred",
 ]);
 // Relations whose target may be a deliberately-unresolved external string rather
 // than an in-repo node id: an import's module specifier, a heritage clause naming
@@ -39,6 +39,10 @@ const CONFIDENCE = new Set<string>([
 // annotation whose type is not declared in-repo. The set is language-agnostic —
 // no other producer currently leaves an unresolved `references` target, so a
 // future bug elsewhere would be masked here.
+//
+// `renders` is deliberately absent. Its whole discipline is that the template was
+// verified to exist as a node before the edge was emitted, so a dangling one is a
+// bug in that check and must read as a violation rather than as an external.
 const TARGET_MAY_BE_EXTERNAL = new Set<string>(["imports", "extends", "implements", "references"]);
 
 export interface InvariantResult {

@@ -90,10 +90,13 @@ function loadBuiltGraph(repo: string): GraphV1 {
   return g!;
 }
 
-test('WALK_RELATIONS (shared, src/graph/relations.ts): exactly the five dependency relations', () => {
+test('WALK_RELATIONS (shared, src/graph/relations.ts): exactly the dependency relations', () => {
   assert.deepEqual(
     [...WALK_RELATIONS].sort(),
-    ['calls', 'extends', 'implements', 'imports', 'references'].sort(),
+    // `renders` joined at M4: a controller action reaching its template is a real
+    // dependency — rename the view and the action breaks — so an impact walk that
+    // stopped at the Ruby would under-report every server-rendered change.
+    ['calls', 'extends', 'implements', 'imports', 'references', 'renders'].sort(),
   );
   // Excluded on purpose: contains is structural (file->symbol), not dependency wiring.
   assert.equal(WALK_RELATIONS.has('contains' as never), false);

@@ -20,6 +20,7 @@ import { contextDirFor, ensureGitignored, ensureSearchable } from "../context/no
 import { extractFile, languageLabelOf, languageOf, type RawEdge } from "./extract.js";
 import { extractGeneric, genericLangOf, warmGenericGrammars } from "./generic.js";
 import { containerLangOf, extractContainer, warmContainerGrammars } from "./container.js";
+import { readIncludeAllHelpers } from "./rails-views.js";
 import { contentHash } from "../util/id.js";
 import { relPosix } from "../util/paths.js";
 import { readSourceFile } from "../util/source.js";
@@ -272,7 +273,7 @@ export async function buildGraph(
       const { nodes: fileNodes, rawEdges: fileEdges } = lang
         ? extractFile(rel, source, lang, { rails })
         : container
-          ? extractContainer(rel, source, container)
+          ? extractContainer(rel, source, container, { rails })
           : extractGeneric(rel, source, generic!.name);
       nodes.push(...fileNodes);
       rawEdges.push(...fileEdges);
@@ -301,6 +302,7 @@ export async function buildGraph(
   const edges = resolveEdges(nodes, rawEdges, {
     goModules: readGoModules(root, repoFiles),
     zeitwerk,
+    railsIncludeAllHelpers: zeitwerk ? readIncludeAllHelpers(root, repoFiles) : undefined,
   });
 
   // Guard 5 (minimum-substance): node counts aren't known until nodes are

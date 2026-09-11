@@ -20,33 +20,71 @@
  * `file:line` is exact, and a plausible-but-wrong line silently sends the reader
  * to the wrong place. `test/container-extract.test.ts` pins this against
  * fixtures whose true line numbers are known.
+ *
+ * ERB (M4) is the second shape, and it is the harder one on exactly that axis: a
+ * template interleaves dozens of small Ruby regions with HTML instead of holding
+ * one contiguous block, so "add the block's start row" becomes a separate chance
+ * to be off by one per tag. It is also the shape a per-region extraction cannot
+ * parse at all — `<% items.each do |i| %>` opens a block that a later region
+ * closes. Both problems have one answer: put the regions back where they already
+ * are and blank everything else to spaces, so there is a single Ruby program and
+ * the shift is zero. See `stitchRegions`, and `test/container-erb.test.ts` for
+ * the fixtures that pin it.
  */
-import { extractFile, mintId, type ExtractResult, type Language, type RawEdge } from "./extract.js";
+import { extractFile, mintId, type ExtractOptions, type ExtractResult, type Language, type RawEdge } from "./extract.js";
 import { loadWasmLanguage, parseWasm, type TsNode } from "./generic.js";
 import { contentHash } from "../util/id.js";
 import type { NodeV1 } from "./types.js";
 
-/** A container language: the wrapper grammar, the node that holds the embedded
+/**
+ * How a container's embedded regions relate to each other.
+ *
+ * `block` — one contiguous region per wrapper node, each a program in its own
+ * right. A Vue SFC's `<script>` is this: it parses alone, so it is extracted
+ * alone and its spans are shifted back by the block's start row.
+ *
+ * `interleaved` — many small regions that are ONE program between them.
+ * `<% items.each do |i| %>` opens a block that a later `<% end %>` closes, and
+ * `<%= i.name %>` in between reads that block's parameter, so extracting region
+ * by region would hand the parser fragments that are not valid Ruby and lose
+ * every binding that crosses a tag. The regions are stitched back into a single
+ * source instead — see `stitchRegions`.
+ */
+export type ContainerLayout = "block" | "interleaved";
+
+/** A container language: the wrapper grammar, the nodes that hold the embedded
  * source, and which depth-tier extractor to hand that source to. */
 export interface ContainerLang {
   name: string;
   exts: string[];
   /** wasm basename in tree-sitter-wasms/out/tree-sitter-<wasm>.wasm */
   wasm: string;
-  /** Wrapper node that represents one embedded block (e.g. Vue's script_element). */
-  block: string;
-  /** Child of `block` holding the raw embedded source (e.g. Vue's raw_text). */
+  /** Wrapper nodes that represent one embedded region (e.g. Vue's script_element,
+   * ERB's directive/output_directive). More than one because a grammar may spell
+   * the same thing several ways — ERB gives `<% %>` and `<%= %>` different types. */
+  blocks: readonly string[];
+  /** Child of a block holding the raw embedded source (e.g. Vue's raw_text, ERB's
+   * `code`). Keying on the child type is also what excludes ERB's
+   * `comment_directive`, whose child is `comment`: a `<%# … %>` is not Ruby. */
   body: string;
   /** Depth-tier grammar for the embedded language. TypeScript is a superset of
    * JavaScript, so it parses both `<script>` and `<script lang="ts">`. */
   inner: Language;
+  layout: ContainerLayout;
 }
 
-/** The container registry. Svelte and Astro are the same shape and would be a
- * row each, but they are left out until someone has a repo to verify them
- * against — a wrong `body` node type would produce silently misplaced spans. */
+/** The container registry. Svelte and Astro are the same shape as Vue and would be
+ * a row each, but they are left out until someone has a repo to verify them
+ * against — a wrong `body` node type would produce silently misplaced spans.
+ *
+ * `.erb` claims every flavour (`.html.erb`, `.turbo_stream.erb`, `.text.erb`), and
+ * that is right for EXTRACTION: the Ruby in a `.text.erb` is Ruby. Only the view
+ * CONVENTIONS (`src/graph/rails-views.ts`) narrow to `.html.erb`, because that is
+ * the one whose lookup path M4 verified. `.haml`/`.slim` are not ERB at all — they
+ * need their own region locator and their own span test, and are deliberately out. */
 export const CONTAINER_LANGS: readonly ContainerLang[] = [
-  { name: "vue", exts: [".vue"], wasm: "vue", block: "script_element", body: "raw_text", inner: "typescript" },
+  { name: "vue", exts: [".vue"], wasm: "vue", blocks: ["script_element"], body: "raw_text", inner: "typescript", layout: "block" },
+  { name: "erb", exts: [".erb"], wasm: "embedded_template", blocks: ["directive", "output_directive"], body: "code", inner: "ruby", layout: "interleaved" },
 ];
 
 const byExt = new Map<string, ContainerLang>();
@@ -120,25 +158,110 @@ function containerFileNode(rel: string, source: string, residual: string): NodeV
   };
 }
 
+/** The body children of one wrapper node, in order. An empty `<script></script>`
+ * or `<%%>` has no body child at all and contributes nothing — the file still gets
+ * its file node, the same shape as a file whose grammar is missing. */
+function bodiesOf(block: TsNode, lang: ContainerLang): TsNode[] {
+  const out: TsNode[] = [];
+  const kids = block.namedChildCount ?? 0;
+  for (let j = 0; j < kids; j++) {
+    const body = block.namedChild?.(j);
+    if (body && body.type === lang.body) out.push(body);
+  }
+  return out;
+}
+
 /** Every embedded block in document order, as [bodyNode] — an SFC may legally
  * carry two (`<script>` for options/exports plus `<script setup>`), and each
- * needs its own offset. */
+ * needs its own offset. Direct children only: a `block`-layout wrapper puts its
+ * blocks at the top level, and descending would let a nested lookalike in. */
 function blocks(root: TsNode, lang: ContainerLang): TsNode[] {
   const out: TsNode[] = [];
   const n = root.namedChildCount ?? 0;
   for (let i = 0; i < n; i++) {
     const child = root.namedChild?.(i);
-    if (!child || child.type !== lang.block) continue;
-    const kids = child.namedChildCount ?? 0;
-    for (let j = 0; j < kids; j++) {
-      const body = child.namedChild?.(j);
-      // An empty `<script></script>` has no body child at all — skipped here, so
-      // the file still gets its file node and nothing else, which is the same
-      // shape as a file whose grammar is missing.
-      if (body && body.type === lang.body) out.push(body);
-    }
+    if (!child || !lang.blocks.includes(child.type)) continue;
+    out.push(...bodiesOf(child, lang));
   }
   return out;
+}
+
+/** Every embedded region of an `interleaved` container, in document order.
+ *
+ * A full descent, unlike `blocks`: an ERB tag inside an attribute value
+ * (`<a href="<%= url %>">`) is a direct child of the template in the grammar as it
+ * stands today, but nothing in the container contract promises that, and a region
+ * missed here is Ruby silently dropped from the graph rather than a visible error. */
+function regions(root: TsNode, lang: ContainerLang): TsNode[] {
+  const out: TsNode[] = [];
+  const visit = (n: TsNode): void => {
+    if (lang.blocks.includes(n.type)) out.push(...bodiesOf(n, lang));
+    const kids = n.namedChildCount ?? 0;
+    for (let i = 0; i < kids; i++) {
+      const child = n.namedChild?.(i);
+      if (child) visit(child);
+    }
+  };
+  visit(root);
+  out.sort((a, b) => a.startIndex - b.startIndex);
+  return out;
+}
+
+/** Everything that is not code, with its line structure intact: every character
+ * becomes a space except the ones that end a line. Same length, same rows, same
+ * columns — and no tokens for the inner grammar to trip over. */
+function blankOut(text: string): string {
+  return text.replace(/[^\n\r]/g, " ");
+}
+
+/**
+ * The embedded source of an `interleaved` container, laid out at its ORIGINAL
+ * offsets: the regions verbatim, everything between them blanked to spaces.
+ *
+ * This is the answer to the span shift this file's header warns about, and for a
+ * template it is the only safe one. Vue can extract one block and add its start row
+ * back afterwards because there is a single offset to add. An ERB template has one
+ * per tag — `app/views/app/documents/index.html.erb` has 84 of them — and a
+ * per-region shift is a per-region chance to be off by one. Re-laying the regions
+ * where they already are makes the shift ZERO, so a span comes back in the
+ * template's own coordinates with no arithmetic to get wrong.
+ *
+ * It is also what Rails does. Erubi (ActionView's ERB handler since 5.1) emits the
+ * template's newlines into its compiled Ruby precisely so a backtrace names the
+ * template line; `<%= __LINE__ %>` on line 4 of a template really does evaluate to
+ * 4 under Erubi. Verified against Erubi 1.13.1, which is also where the stdlib
+ * `ERB` differs — it prepends a magic comment and reports 5.
+ */
+function stitchRegions(source: string, found: readonly TsNode[]): string {
+  const out: string[] = [];
+  let at = 0;
+  for (const r of found) {
+    // Regions are sorted and cannot legally overlap; a grammar error that produced
+    // an overlap would corrupt every offset after it, so drop rather than splice.
+    if (r.startIndex < at) continue;
+    out.push(blankOut(source.slice(at, r.startIndex)));
+    out.push(source.slice(r.startIndex, r.endIndex));
+    at = r.endIndex;
+  }
+  out.push(blankOut(source.slice(at)));
+  return out.join("");
+}
+
+/**
+ * The embedded source of an `interleaved` container file, laid out at its original
+ * offsets — null for any other layout, or when the grammar is not warm.
+ *
+ * Exported because the span guarantee IS a property of this string: Ruby written on
+ * template line N must come back on line N of it. Asserting that directly is what
+ * makes a broken region locator fail at its cause instead of one layer downstream,
+ * as a span that is quietly off by one.
+ */
+export function embeddedSource(source: string, lang: ContainerLang): string | null {
+  if (lang.layout !== "interleaved") return null;
+  const language = loaded.get(lang.name);
+  if (!language) return null;
+  const root = parseWasm(language, source);
+  return root ? stitchRegions(source, regions(root, lang)) : null;
 }
 
 /**
@@ -147,8 +270,16 @@ function blocks(root: TsNode, lang: ContainerLang): TsNode[] {
  * Never throws: a missing grammar, an unparseable SFC or a script block the
  * inner extractor chokes on all degrade to "fewer nodes", because a build must
  * not fail over one component.
+ *
+ * `opts` is forwarded to the inner depth-tier extractor, so an `.erb` template in a
+ * Rails app is parsed with the same Rails vocabulary as a `.rb` file in it.
  */
-export function extractContainer(rel: string, source: string, lang: ContainerLang): ExtractResult {
+export function extractContainer(
+  rel: string,
+  source: string,
+  lang: ContainerLang,
+  opts: ExtractOptions = {},
+): ExtractResult {
   const nodes: NodeV1[] = [];
   const rawEdges: RawEdge[] = [];
   const residuals: string[] = [];
@@ -156,7 +287,24 @@ export function extractContainer(rel: string, source: string, lang: ContainerLan
   const language = loaded.get(lang.name);
   const root = language ? parseWasm(language, source) : null;
 
-  if (root) {
+  if (root && lang.layout === "interleaved") {
+    const stitched = stitchRegions(source, regions(root, lang));
+    let inner: ExtractResult | null = null;
+    try {
+      inner = extractFile(rel, stitched, lang.inner, opts);
+    } catch {
+      inner = null; // one bad template, not a bad build
+    }
+    if (inner) {
+      // No shift and no rename pass, both by construction: the regions were
+      // re-laid at their own offsets, so the spans are already the template's,
+      // and one `extractFile` mints one set of ids for the whole file.
+      const [innerFile, ...symbols] = inner.nodes;
+      if (innerFile?.body_text) residuals.push(innerFile.body_text);
+      nodes.push(...symbols);
+      rawEdges.push(...inner.rawEdges);
+    }
+  } else if (root) {
     // Ids are minted per file by the inner extractor, so two script blocks that
     // both define `setup` would collide. Threading one set across the blocks
     // makes the second one `path#setup~2`, and the rename is applied to that

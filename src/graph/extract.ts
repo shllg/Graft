@@ -288,6 +288,37 @@ export interface RawEdge {
    * the source text), and where it does not, minting one would put a dependency in
    * the graph that the file does not contain. */
   rubyTypeOnly?: boolean;
+  /** Ruby/Rails only (M4): the template spec this call names, exactly as written —
+   * `render "shared/nav"`, `render :edit`, `layout "admin"`. A path, not a symbol:
+   * `resolve.ts` turns it into a file under the view root beside the rendering file
+   * and emits nothing when no such template was indexed. Kept as the literal because
+   * which of Rails' two lookups applies is a property of the CALL, not of the
+   * string — a controller's `render "shared/banner"` is a template and a view's is a
+   * partial, which ActionController's own `_normalize_args` is what settles. */
+  railsTemplateSpec?: string;
+  /** Ruby/Rails only (M4): which lookup `railsTemplateSpec` takes. Absent together
+   * with the spec on a `renders` edge that is a CARRIER rather than an edge: a
+   * `render` in a controller whose target this pass cannot name still tells us the
+   * action rendered something, which is what stops the naming convention claiming
+   * a template Rails would never reach. */
+  railsTemplateKind?: "template" | "partial" | "layout";
+  /** Ruby/Rails only (M4): a carrier, never an edge — an instance variable used by a
+   * controller method or read by a template, for the contract between the two.
+   * `@documents` assigned in an action and read in the view Rails renders for it is
+   * a real interface that neither file states, and unlike the two names in a
+   * `renders` edge it is checkable from the source of both sides. Emitted only for
+   * the two file shapes that can form such a pair; one raw edge per ivar OCCURRENCE
+   * across a whole Rails app would be tens of thousands of them for a relationship
+   * that means nothing anywhere else. */
+  railsIvar?: string;
+  /** Ruby/Rails only (M4): this use ASSIGNS the ivar. Absent means it reads it. */
+  railsIvarWrite?: boolean;
+  /** Ruby/Rails only (M4): this `references` edge came from `helper_method :name`,
+   * so its target is callable from every template the declaring controller renders.
+   * The edge itself is the declaration — a controller really does name that method —
+   * and the flag is what lets resolve.ts also file the target in the index a
+   * template's bare words are resolved against. */
+  railsHelperExport?: boolean;
 }
 
 export interface ExtractResult {
@@ -579,6 +610,11 @@ export interface WalkCtx {
   // exist. Detection happens once per build (see zeitwerk.ts) and is deliberately
   // conservative; directory shape alone never implies Rails.
   rubyRails: RailsContext | null;
+  /** M4: which half of the controller↔template instance-variable contract this file
+   * can supply, or null for the overwhelming majority of files that are neither.
+   * Computed once per file rather than tested per node, and null is what keeps a
+   * whole Rails app from emitting one carrier edge per `@ivar` occurrence. */
+  railsIvarRole: "writer" | "reader" | null;
   // Ruby (M2): are we inside an ActiveSupport::Concern's `included do ... end`?
   // That block executes in the INCLUDER, so a callback declared there is a callback
   // on every class that includes the concern, not on the concern itself. The edges
@@ -706,6 +742,7 @@ export function extractFile(rel: string, source: string, lang: Language, opts: E
     rubyPostHoc: EMPTY_MAP,
     rubyNesting: EMPTY_NESTING,
     rubyRails: opts.rails ?? null,
+    railsIvarRole: opts.rails ? railsIvarRole(rel) : null,
     rubyIncludedBlock: false,
     rubyOwnDefs: EMPTY_SET,
     rubyClassScope: null,
@@ -862,6 +899,10 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
     walkNamedChildren(node.namedChildren, { ...ctx, rubySelfKind: "unknown" }, out, edges, minted);
     return;
   }
+  // M4: the controller↔template instance-variable contract. Emitted here, before
+  // anything consumes the node, because `@documents = …` is an assignment rather than
+  // a call and the branches below never see it as one.
+  if (ctx.rubyRails && ctx.railsIvarRole) rubyIvarEdges(node, ctx, edges);
   const desc = describe(node, ctx);
   if (desc) {
     // `idName` scopes the id (e.g. a Go method under its receiver: `#DB.Count`) while
@@ -1221,6 +1262,14 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
           return;
         }
       }
+    }
+    // M4: Rails' render vocabulary, additively — a `render "shared/nav"` is both a
+    // template reference and (harmlessly) an ordinary call to a method no repo
+    // defines. Placed here rather than in the class-body macro table above because
+    // `render` is written inside method bodies and at a template's top level, never
+    // as a class-body declaration.
+    if (ctx.lang === "ruby" && ctx.rubyRails && node.type === "call") {
+      edges.push(...rubyRenderEdges(node, ctx));
     }
     const consumedCallee = ctx.lang === "r" && node.type === "call" ? rCalleeName(node) : null;
     const isConsumedRClassCall =
@@ -2929,6 +2978,155 @@ function rubyMacroOption(
 }
 
 /**
+ * Which half of the controller↔template instance-variable contract a file can supply.
+ *
+ * `@documents` assigned in `DocumentsController#index` and read in
+ * `app/views/documents/index.html.erb` is a real interface between two files that
+ * never name each other — and, unlike the `renders` edge between them, one both
+ * sides state in their own source. It is also the only ivar relationship worth
+ * recording: everywhere else an instance variable is private to its object, and
+ * emitting a carrier edge per occurrence across a whole Rails app would be tens of
+ * thousands of them to describe nothing.
+ *
+ * So only two shapes qualify, and the test is the path, which is what the Rails
+ * convention is made of in the first place.
+ */
+export function railsIvarRole(rel: string): "writer" | "reader" | null {
+  if (RAILS_CONTROLLER_FILE.test(rel)) return "writer";
+  return rel.toLowerCase().endsWith(".erb") ? "reader" : null;
+}
+
+/**
+ * The ivar carriers for one node: an assignment in a controller, a read in a
+ * template. Never an edge in its own right — `resolve.ts` pairs the two sides and
+ * drops everything it cannot pair.
+ *
+ * A controller records only WRITES. A read there (`@documents.each` inside a
+ * `before_action`) says nothing about what a template needs, and counting it as a
+ * write would make every ivar look like it had several writers and decline the lot.
+ */
+function rubyIvarEdges(node: Parser.SyntaxNode, ctx: WalkCtx, edges: RawEdge[]): void {
+  if (ctx.railsIvarRole === "writer") {
+    if (node.type !== "assignment" && node.type !== "operator_assignment") return;
+    const left = node.childForFieldName("left");
+    if (left?.type !== "instance_variable") return;
+    edges.push({
+      source: ctx.parentId, relation: "references", name: left.text, file: ctx.rel,
+      railsIvar: left.text, railsIvarWrite: true,
+    });
+    return;
+  }
+  if (node.type !== "instance_variable") return;
+  edges.push({
+    source: ctx.parentId, relation: "references", name: node.text, file: ctx.rel,
+    railsIvar: node.text,
+  });
+}
+
+/** Does this call have a positional argument at all? A `render` whose arguments are
+ * all keywords (`render json: x`, `render status: :ok`) names no template; one with
+ * a positional does, whether or not this pass can read it. */
+function rubyHasPositionalArg(args: Parser.SyntaxNode | null): boolean {
+  const first = args?.namedChildren?.[0];
+  return !!first && first.type !== "pair" && first.type !== "hash";
+}
+
+/** The first positional argument of a call, when it is a plain string or symbol
+ * literal and nothing else. An interpolated string, a constant, a variable or a
+ * method call all return null — `render @document` and `render Card.new` name a
+ * template only at runtime, and a static pass that answered them would be guessing. */
+function rubyFirstLiteralArg(args: Parser.SyntaxNode | null): string | null {
+  const first = args?.namedChildren?.[0];
+  if (!first) return null;
+  if (first.type === "simple_symbol") return first.text.slice(1);
+  if (first.type !== "string") return null;
+  const content = first.namedChildren.find((c) => c.type === "string_content");
+  // Same test `rubyMacroOption` uses: a `string_content` that does not span the whole
+  // literal means there was interpolation in it.
+  return content && content.text === first.text.slice(1, -1) ? content.text : null;
+}
+
+/** A controller file, by Rails' own `app/controllers/**_controller.rb` convention —
+ * which is what decides whether a bare `render "shared/banner"` names a TEMPLATE or
+ * a PARTIAL. Verified: `ActionController::Base#_normalize_args("shared/banner")`
+ * returns `{template: "shared/banner"}`, while the same string in a view is
+ * `ActionView`'s partial shorthand. */
+const RAILS_CONTROLLER_FILE = /(?:^|\/)app\/controllers\/.+_controller\.rb$/;
+
+/**
+ * Rails' render vocabulary at a CALL site — `render "shared/nav"`, `render :edit`,
+ * `render partial: "row"`, `render template: "x/y"`, `render layout: "wide"`.
+ *
+ * Additive, not consuming: `render` is ActionView's, no repo defines it, and the
+ * ordinary call edge this call also produces resolves to nothing on its own. What is
+ * emitted here is the template SPEC as written; turning it into a path is
+ * `resolve.ts`'s job, because only it knows which templates were actually indexed
+ * and an edge to a template that is not there must not exist.
+ *
+ * Everything that is not a literal declines. `render @document` really does render a
+ * template in Rails — `app/views/documents/_document.html.erb`, via the model's
+ * `to_partial_path` — and it is left alone anyway: that path depends on the object's
+ * CLASS at runtime, and `@document` has no type here.
+ */
+function rubyRenderEdges(node: Parser.SyntaxNode, ctx: WalkCtx): RawEdge[] {
+  if (node.childForFieldName("receiver")) return []; // `x.render` is somebody else's
+  const method = node.childForFieldName("method");
+  if (method?.text !== "render" && method?.text !== "render_to_string") return [];
+  const args = node.childForFieldName("arguments");
+  const out: RawEdge[] = [];
+  const emit = (spec: string, kind: "template" | "partial" | "layout"): void => {
+    out.push({
+      source: ctx.parentId,
+      relation: "renders",
+      name: spec,
+      file: ctx.rel,
+      railsTemplateSpec: spec,
+      railsTemplateKind: kind,
+    });
+  };
+
+  const partial = rubyMacroOption(args, "partial");
+  const template = rubyMacroOption(args, "template");
+  const layout = rubyMacroOption(args, "layout");
+  if (typeof partial?.value === "string") emit(partial.value, "partial");
+  if (typeof template?.value === "string") emit(template.value, "template");
+  // `layout:` rides ALONGSIDE whatever is being rendered rather than replacing it,
+  // which is why it is not part of the either/or below.
+  if (typeof layout?.value === "string") emit(layout.value, "layout");
+  const inController = RAILS_CONTROLLER_FILE.test(ctx.rel);
+  const positional = rubyHasPositionalArg(args);
+  // The positional spec, unless an explicit key already said what this renders.
+  if (!partial && !template) {
+    const first = rubyFirstLiteralArg(args);
+    if (first !== null) emit(first, inController ? "template" : "partial");
+  }
+  // In a controller, a render that REPLACES the action's template matters beyond
+  // what it names: Rails reaches the naming convention only for an action that
+  // rendered nothing, so `def update; render @document; end` never renders
+  // `update.html.erb`. A spec-less carrier records that, and it is the unnameable
+  // renders — `render @document`, `render "shared/#{x}"` — that need it most,
+  // because those have no edge of their own to supersede the convention with.
+  //
+  // `render json:` is deliberately NOT one of them, and the distinction is not
+  // pedantic: the commonest shape in a real controller is
+  //
+  //     def index
+  //       respond_to do |format|
+  //         format.html
+  //         format.json { render json: @document_types }
+  //       end
+  //     end
+  //
+  // where the HTML branch renders `index.html.erb` by the convention and the JSON
+  // branch renders no template at all. Suppressing on any `render` whatsoever cost
+  // exactly those four edges on filewerk, every one of them real.
+  if (inController && (positional || partial || template)) {
+    out.push({ source: ctx.parentId, relation: "renders", file: ctx.rel });
+  }
+  return out;
+}
+
+/**
  * Apply a macro's `prefix:`/`suffix:` options to the names it would otherwise define.
  *
  * Returns null when an option is present but cannot be read — synthesize nothing
@@ -3291,6 +3489,44 @@ function rubyMacroEdges(node: Parser.SyntaxNode, ctx: WalkCtx, classId: string):
     return out;
   }
 
+  if (macro === "helper_method") {
+    // `helper_method :current_user` exports a controller method to every template
+    // that controller renders. Emitted with the same shape as `validates` — an
+    // owner-qualified `references` that declines when the class has no such method —
+    // plus the flag that tells resolve.ts to file the target under a name a
+    // template's bare words may resolve to. A template's `self` is an
+    // `ActionView::Base`, so without a declaration like this one a bare word in a
+    // view has nothing it can legitimately reach.
+    for (const sym of syms) {
+      out.push({
+        source: classId, relation: "references", name: sym, file: ctx.rel,
+        recvType: ctx.enclosingClass!,
+        railsHelperExport: true,
+        ...(ctx.rubyNesting[0] ? { rubyOwnerFqn: ctx.rubyNesting[0] } : {}),
+        ...(ctx.rubyIncludedBlock ? { viaConcern: true } : {}),
+      });
+    }
+    return out;
+  }
+
+  if (macro === "layout" && ctx.enclosingClass !== null) {
+    // `layout "admin"` names a template outright. One edge from the class, at the
+    // class, because a layout applies to every action it declares — including the
+    // ones a subclass adds, which is why the SOURCE is the controller and not an
+    // action. `layout nil`, `layout :method_name` and `layout false` name no file
+    // and produce nothing; `rubyFirstLiteralArg` is what declines them. Gated on
+    // being inside a class because `layout` is an ordinary English word — and
+    // because, unlike `has_many`, a method could plausibly be called that.
+    const spec = rubyFirstLiteralArg(args);
+    if (spec !== null) {
+      out.push({
+        source: classId, relation: "renders", name: spec, file: ctx.rel,
+        railsTemplateSpec: spec, railsTemplateKind: "layout",
+      });
+    }
+    return out;
+  }
+
   if (macro === "validates" || macro === "validates_presence_of") {
     // Points at the attribute when one exists as a node — usually only when it was
     // itself declared by a macro (`attribute :email`) or written by hand. A plain DB
@@ -3481,7 +3717,13 @@ function rubyBareCallPosition(node: Parser.SyntaxNode, ctx: WalkCtx): boolean {
  *   - `alias`/`undef` — both take method names, not values.
  */
 const RUBY_VALUE_PARENTS: ReadonlySet<string> = new Set([
-  // statement lists: an identifier standing alone as its own statement
+  // statement lists: an identifier standing alone as its own statement.
+  // `program` is the FILE's own statement list, and it is here because of ERB
+  // (M4): a template stitches to Ruby at top level, so `<%= current_user %>` — the
+  // commonest tag there is — parses as a lone identifier whose parent is `program`
+  // and nothing else. It is the same read in a `.rb` file, where Ruby also calls it;
+  // measured on filewerk and dailywerk, adding it moved no `.rb` edge at all.
+  "program",
   "body_statement", "block_body", "then", "else", "ensure", "do", "begin",
   // expressions
   "argument_list", "right_assignment_list", "binary", "unary", "conditional",

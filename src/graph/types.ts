@@ -46,8 +46,24 @@ export type Kind =
  * ancestors. It sits below `extracted` because it reasons across files, and above
  * `inferred` because `inferred` is a bare-name guess with no receiver behind it:
  * the whole point of separating them is that a reader (and `graph-quality`) can
- * see which edges came from a type and which from a name. */
-export type Confidence = "lsp_resolved" | "lsp_dispatch" | "extracted" | "type_bound" | "inferred";
+ * see which edges came from a type and which from a name.
+ *
+ * `convention` is the framework-rule reading (M4): nothing in either file names the
+ * other, and the edge exists because a framework's own naming rule connects them —
+ * `DocumentsController#index` renders `app/views/documents/index.html.erb`, a view
+ * can call any module under `app/helpers/`. It sits below `type_bound` because a
+ * convention is a rule about where things are PUT, not about what they are, and
+ * above `inferred` because it is never a guess between candidates: the rule names
+ * one target, that target was verified to exist as a node, and an ambiguous rule
+ * emits nothing. An edge the source states outright — `render "shared/nav"`,
+ * `layout "admin"` — is `extracted` and not this. */
+export type Confidence =
+  | "lsp_resolved"
+  | "lsp_dispatch"
+  | "extracted"
+  | "type_bound"
+  | "convention"
+  | "inferred";
 
 /** Whether the LLM meaning-layer has been computed for a node. */
 export type SummaryState = "pending" | "ready" | "stale";
@@ -124,7 +140,16 @@ export type Relation =
   | "imports" // file → module
   | "references" // symbol → symbol it names but doesn't call
   | "implements" // TS: class → interface
-  | "extends"; // class → base class
+  | "extends" // class → base class
+  // Rails (M4): a method hands rendering to a TEMPLATE — a controller action to its
+  // conventional view, an explicit `render :edit`, a `layout "admin"` declaration, a
+  // template to a partial it includes. Its own relation rather than a `calls`, for
+  // two reasons. It is not a call: control leaves for a file, the target is a `file`
+  // node rather than a symbol, and counting it among `calls` would move the
+  // call-resolution rate this project measures itself by. And M4's acceptance asks
+  // for the precision of these edges SPECIFICALLY — the lesson of T7b is that a
+  // claim mixed into a larger number is a claim the harness cannot check.
+  | "renders";
 
 export interface EdgeV1 {
   source: string; // node id

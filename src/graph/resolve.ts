@@ -18,6 +18,20 @@ import type { EdgeV1, Kind, NodeV1, Relation } from "./types.js";
 import { languageOf, type RawEdge } from "./extract.js";
 import type { RubySelfKind, RubyType, RubyValueKind } from "./bindings.js";
 import { genericLangOf } from "./generic.js";
+import { containerLangOf } from "./container.js";
+import {
+  controllerViews,
+  controllerFileFor,
+  isTemplatePath,
+  isViewHelperPath,
+  layoutTarget,
+  partialTarget,
+  templatePath,
+  templatePrefix,
+  templateTarget,
+  viewRootFor,
+  DEFAULT_LAYOUT,
+} from "./rails-views.js";
 import { isAutoloadHome, type ZeitwerkMap } from "./zeitwerk.js";
 
 const IMPORT_EXTS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".py"];
@@ -65,9 +79,18 @@ for (const group of FAMILIES) for (const lang of group) FAMILY_OF.set(lang, grou
 /**
  * The language family a path belongs to, or null when no tier claims the file.
  * A language of its own is its own family, so the common case needs no entry above.
+ *
+ * The container tier is consulted LAST and by its inner language, because that is
+ * what a container file's symbols actually are: the Ruby in an `.erb` is Ruby and
+ * the script in a `.vue` is TypeScript. Without this the guard read every container
+ * file as "unknown family" and — per the rule below, that absence of data never
+ * filters — let a bare word in a template reach a definition in any language in the
+ * repo. filewerk has 45 Ruby top-level `def`s, all but one of them in `spec/`, and
+ * they include `url_for`, `root_path`, `name` and `metadata`: exactly the names a
+ * view writes.
  */
 function familyOf(path: string): string | null {
-  const lang = languageOf(path) ?? genericLangOf(path)?.name ?? null;
+  const lang = languageOf(path) ?? genericLangOf(path)?.name ?? containerLangOf(path)?.inner ?? null;
   if (!lang) return null;
   return FAMILY_OF.get(lang) ?? lang;
 }
@@ -104,6 +127,11 @@ export interface ResolveOptions {
    * already find. A plain Ruby project therefore resolves constants identically
    * with or without it. */
   zeitwerk?: ZeitwerkMap | null;
+  /** M4: false when the app writes `config.action_controller.include_all_helpers =
+   * false`, which stops every `app/helpers/` module being mixed into every view.
+   * Absent means Rails' default, true. Checked rather than assumed: assuming it
+   * would put edges into helpers a template provably cannot reach. */
+  railsIncludeAllHelpers?: boolean;
 }
 
 export function resolveEdges(
@@ -400,6 +428,133 @@ export function resolveEdges(
     return out;
   };
 
+  // ---------------------------------------------------------------------------
+  // M4: Rails view conventions. See `rails-views.ts` for the rules and the oracle
+  // runs behind them; what lives here is the part that needs the whole node set.
+  // ---------------------------------------------------------------------------
+
+  // Every template that was actually INDEXED, keyed by its node id (= its path).
+  // The node set and not the filesystem: a template excluded by an ignore rule or
+  // an `--only-dir` has nothing to point at, and "the file is on disk" is not the
+  // check that matters — "there is a node to name" is.
+  const railsTemplates = new Set<string>();
+  for (const n of nodes) if (n.kind === "file" && isTemplatePath(n.path)) railsTemplates.add(n.id);
+
+  /**
+   * Names a template may call on its own `self`, and the node each one means.
+   *
+   * A template's `self` is an `ActionView::Base`, a class no repo defines, so a bare
+   * word in one is NOT the free-function call it is in a `.rb` file. Two declarations
+   * make a name legitimately reachable — a module under `app/helpers/`, because
+   * `include_all_helpers` mixes all of them into every view, and a controller's
+   * `helper_method :current_user`. A name more than one of them defines is declined.
+   */
+  const railsViewHelpers = new Map<string, string[]>();
+  const noteViewHelper = (name: string, id: string): void => {
+    const at = railsViewHelpers.get(name);
+    if (!at) railsViewHelpers.set(name, [id]);
+    else if (!at.includes(id)) at.push(id);
+  };
+  if (zeitwerk && opts.railsIncludeAllHelpers !== false) {
+    for (const n of nodes) {
+      // `receiver === "class"` is a `def self.x` on the helper module: a view holds
+      // an INSTANCE of the view context with the module mixed in, so it reaches the
+      // module's instance methods and never its singleton ones.
+      if (n.kind === "method" && n.receiver !== "class" && isViewHelperPath(n.path)) {
+        noteViewHelper(n.name, n.id);
+      }
+    }
+  }
+  if (zeitwerk) {
+    for (const e of rawEdges) {
+      if (!e.railsHelperExport || !e.name || !e.rubyOwnerFqn) continue;
+      // Against the DECLARING class, not the includers `rubyMacroSubjects` would
+      // give. `helper_method :current_user` inside `Authenticatable` names
+      // `Authenticatable#current_user`, and it names the same method however many
+      // controllers include the concern — including none, which is the case where
+      // going through the includers registered nothing at all.
+      const hit = resolveRubyOwnerMethod(e.rubyOwnerFqn, e.name, e.file, rubyOwnerMethod, rubyDispatch);
+      if (hit && hit !== "ambiguous") noteViewHelper(e.name, hit.id);
+    }
+  }
+
+  // The two halves of the instance-variable contract, gathered from the carriers
+  // extract.ts emitted for controllers and templates. Writers are keyed by the
+  // CONTROLLER FILE rather than by class, because the pairing is by directory and a
+  // controller reopened in two files would otherwise answer for only one of them.
+  const railsIvarWriters = new Map<string, Map<string, Set<string>>>();
+  const railsIvarReaders = new Map<string, Set<string>>();
+  for (const e of rawEdges) {
+    if (!e.railsIvar) continue;
+    if (e.railsIvarWrite) {
+      let byIvar = railsIvarWriters.get(e.file);
+      if (!byIvar) railsIvarWriters.set(e.file, (byIvar = new Map()));
+      const at = byIvar.get(e.railsIvar);
+      if (at) at.add(e.source);
+      else byIvar.set(e.railsIvar, new Set([e.source]));
+    } else {
+      const at = railsIvarReaders.get(e.file);
+      if (at) at.add(e.railsIvar);
+      else railsIvarReaders.set(e.file, new Set([e.railsIvar]));
+    }
+  }
+
+  /**
+   * Methods that render something themselves, so the naming convention is not ALSO
+   * claimed for them.
+   *
+   * Rails reaches the convention only when the action produced no response at all,
+   * and `update`'s `render :edit` is exactly that case: `update.html.erb` is never
+   * rendered even when it exists. The marker is a `renders` carrier with no spec —
+   * see `RawEdge.railsTemplateSpec` — because a render this pass CANNOT name is
+   * still a render, and `render @document` is the shape where claiming the
+   * conventional template would be most confidently wrong.
+   */
+  const railsExplicitRender = new Set<string>();
+  for (const e of rawEdges) {
+    if (e.relation === "renders" && !e.railsTemplateSpec) railsExplicitRender.add(e.source);
+  }
+
+  /** Controller files whose class declared a layout, so the `application` default is
+   * not also claimed for them. */
+  const railsDeclaredLayout = new Set<string>();
+  for (const e of rawEdges) {
+    if (e.relation === "renders" && e.railsTemplateKind === "layout") railsDeclaredLayout.add(e.source);
+  }
+
+  /** Directories some controller owns, as `<root>\0<prefix>` — what makes a
+   * slash-less partial spec resolvable at all. See `partialTarget`. */
+  const railsControllerPrefixes = new Set<string>();
+  for (const n of nodes) {
+    if (n.kind !== "file") continue;
+    const cv = controllerViews(n.path);
+    if (cv) railsControllerPrefixes.add(`${cv.root}\0${cv.prefix}`);
+  }
+
+  /**
+   * The file a `render`/`layout` spec names, or null when the convention cannot name
+   * exactly one. Existence is checked by the caller, against the node set.
+   */
+  const railsRenderTarget = (from: string, spec: string, kind: "template" | "partial" | "layout"): string | null => {
+    const root = viewRootFor(from);
+    if (!root) return null;
+    if (kind === "layout") return layoutTarget(root, spec);
+    // A controller's own `controller_path` is the first prefix in its lookup chain,
+    // so a slash-less spec written there resolves against it exactly.
+    const ctrl = controllerViews(from);
+    if (ctrl) {
+      return kind === "template"
+        ? templateTarget(root, spec, ctrl.prefix)
+        : partialTarget(root, spec, ctrl.prefix);
+    }
+    // Written in a template: the fallback prefix is its own directory, and only when
+    // that directory is some controller's — see `partialTarget` for the oracle run
+    // that rules out the tempting "resolve it next door".
+    const own = templatePrefix(root, from);
+    const usable = own !== null && railsControllerPrefixes.has(`${root}\0${own}`) ? own : null;
+    return kind === "template" ? templateTarget(root, spec, usable) : partialTarget(root, spec, usable);
+  };
+
   const out: EdgeV1[] = [];
   const seen = new Set<string>();
   const add = (source: string, target: string, relation: Relation, confidence: EdgeV1["confidence"]) => {
@@ -413,6 +568,11 @@ export function resolveEdges(
     // A type carrier states a fact for the pre-passes above and is not a
     // dependency the source file contains. See `RawEdge.rubyTypeOnly`.
     if (e.rubyTypeOnly) continue;
+    // The same, for M4's instance-variable carriers: `@documents` is not a symbol
+    // anywhere in this graph, and the only thing it can connect is a controller
+    // method to a template — which the pass after this loop does, once both halves
+    // have been gathered. See `RawEdge.railsIvar`.
+    if (e.railsIvar) continue;
     if (e.relation === "contains" && e.targetId) {
       add(e.source, e.targetId, "contains", "extracted");
     } else if (e.relation === "imports" && e.specifier) {
@@ -545,6 +705,15 @@ export function resolveEdges(
         const hit = resolveName(e.name, e.file, refKinds, perFileName, globalName);
         if (hit && hit.id !== e.source) add(e.source, hit.id, "references", hit.confidence);
       }
+    } else if (e.relation === "renders") {
+      // M4: a template the source NAMES — `render "shared/nav"`, `render :edit`,
+      // `layout "admin"`. `extracted`, not `convention`: the spec is written down,
+      // and all the convention supplied was the directory to look in.
+      if (!e.railsTemplateSpec || !e.railsTemplateKind) continue;
+      const target = railsRenderTarget(e.file, e.railsTemplateSpec, e.railsTemplateKind);
+      // No such template was indexed → no edge. This is the whole discipline: a
+      // convention that names a file which is not there has not found anything.
+      if (target && railsTemplates.has(target)) add(e.source, target, "renders", "extracted");
     } else if (e.relation === "calls") {
       if (e.rubyRecvBase) {
         // M3: the receiver's type is known, so the method is looked up on that
@@ -604,6 +773,27 @@ export function resolveEdges(
         // member edge alone, exactly as Swift dispatches it.
         if (!e.implicitSelf) continue;
       }
+      // M4: a bare word in a TEMPLATE is not a free-function call.
+      //
+      // A template's `self` is an `ActionView::Base`, a class no repo defines, so
+      // the repo-wide bare-name ladder below has nothing legitimate to find and a
+      // great deal to find by accident — filewerk's 45 Ruby top-level `def`s
+      // include `url_for`, `root_path`, `name` and `metadata`, and 44 of them are in
+      // `spec/`. What a view CAN reach is what a declaration says it can: a module
+      // under `app/helpers/`, or a name a controller exported with `helper_method`.
+      // Two definitions of a name means two possible owners, and that declines.
+      //
+      // A `def` written inside the template itself is tried first and is exact —
+      // same file, no ambiguity to have.
+      if (containerLangOf(e.file)?.layout === "interleaved") {
+        const own = (perFileName.get(e.file)?.get(e.name!) ?? []).filter((n) => n.kind === "function");
+        if (own.length === 1) add(e.source, own[0].id, "calls", "extracted");
+        else {
+          const helpers = railsViewHelpers.get(e.name!) ?? [];
+          if (helpers.length === 1 && helpers[0] !== e.source) add(e.source, helpers[0], "calls", "convention");
+        }
+        continue;
+      }
       // Every language's bare-name call is a free function, except R (Phase 4):
       // an untyped `obj$method()` there sets e.kinds to also allow a "method"
       // match — see extract.ts's calleeName R branch for why (R6 methods are
@@ -646,6 +836,68 @@ export function resolveEdges(
       if (hit) add(e.source, hit.id, "calls", hit.confidence); // drop unresolved calls (too noisy)
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // M4: the edges nothing in either file writes down.
+  // ---------------------------------------------------------------------------
+
+  // Gated on Rails detection, exactly as the macro vocabulary is: `app/controllers`
+  // and `app/views` are directory names, and a plain Ruby project that happens to
+  // use them must come out of this pass untouched.
+  //
+  // A controller action renders the template that shares its name. Emitted for an
+  // action DEFINED in that controller — an inherited one renders the subclass's
+  // template through a prefix chain this pass does not walk, and answering it from
+  // the base class's own directory would be a different file.
+  for (const n of zeitwerk ? nodes : []) {
+    if (n.kind !== "method" || n.receiver === "class") continue;
+    const cv = controllerViews(n.path);
+    if (!cv) continue;
+    // An action that renders something EXPLICITLY has told us what it renders, and
+    // Rails then never reaches the convention at all. `update` answering
+    // `render :edit` must not also claim an `update.html.erb` that happens to exist.
+    if (railsExplicitRender.has(n.id)) continue;
+    const target = templatePath(cv.root, cv.prefix, n.name);
+    if (railsTemplates.has(target)) add(n.id, target, "renders", "convention");
+  }
+
+  // `ApplicationController` with no `layout` of its own gets Rails' default. Only
+  // that one class, deliberately: a layout is inherited, so `App::DocumentsController
+  // < App::BaseController` uses the `layout "app"` its parent declares, and claiming
+  // `application` for it would be wrong. From the root class the chain is followable
+  // through the `extends` edges already in the graph.
+  for (const n of zeitwerk ? nodes : []) {
+    if (n.kind !== "class" || n.name !== "ApplicationController") continue;
+    if (railsDeclaredLayout.has(n.id)) continue;
+    const root = viewRootFor(n.path);
+    if (!root) continue;
+    const target = templatePath(root, "layouts", DEFAULT_LAYOUT);
+    if (railsTemplates.has(target)) add(n.id, target, "renders", "convention");
+  }
+
+  // The instance-variable contract: `@documents` assigned in exactly one method of
+  // the controller that owns this template's directory, and read in the template.
+  //
+  // Uniqueness is what makes it precise, and it is doing real work rather than
+  // guarding a corner: `@document` is written by `show`, `edit` AND `update` in one
+  // controller, so "which of them does `edit.html.erb` mean?" has no answer and the
+  // pair is dropped. Measured on filewerk: 58 pairs resolve, 28 decline as ambiguous.
+  for (const [template, ivars] of railsIvarReaders) {
+    if (!railsTemplates.has(template)) continue;
+    const root = viewRootFor(template);
+    const prefix = root ? templatePrefix(root, template) : null;
+    if (root === null || prefix === null) continue;
+    const controller = controllerFileFor(root, prefix);
+    const writers = controller ? railsIvarWriters.get(controller) : undefined;
+    if (!writers) continue;
+    for (const ivar of ivars) {
+      const who = writers.get(ivar);
+      if (!who || who.size !== 1) continue;
+      const [only] = who;
+      if (only !== template) add(only, template, "references", "convention");
+    }
+  }
+
   return out;
 }
 

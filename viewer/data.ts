@@ -65,6 +65,7 @@ export type Family = "structure" | "dependency" | "contract" | "association";
 const FAMILY: Record<string, Family> = {
   part_of: "structure", contains: "structure",
   uses: "dependency", depends_on: "dependency", calls: "dependency", imports: "dependency",
+  renders: "dependency",
   produces: "dependency", configures: "dependency", validates: "dependency",
   extends: "contract", implements: "contract",
   references: "association",
@@ -94,6 +95,7 @@ export const CHIP_HINT: Record<string, string> = {
   "extends": "what contract must this honor? (inheritance)",
   "implements": "what contract must this honor? (interface)",
   "references": "mentioned but never called — possible dead coupling",
+  "renders": "which template does this hand off to? (Rails view conventions)",
 };
 
 /** Node-type → CSS custom property, per tab. */
