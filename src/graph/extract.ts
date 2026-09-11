@@ -23,12 +23,19 @@ import { associationConstant } from "./zeitwerk.js";
 import {
   collectBindings,
   rubyMethodReturnType,
+  rubyConstructorType,
+  rubyScopeKey,
   goReceiverVarOf,
   resolveRecvType,
   cppDeclaratorName,
   resolveCppQualified,
   stripCppTemplateArgs,
   type FileBindings,
+  type RubySelfKind,
+  type RubySelfContext,
+  type RubyType,
+  type RubyValueKind,
+  type RubyTypeCtx,
 } from "./bindings.js";
 import type { Kind, NodeV1, Relation } from "./types.js";
 
@@ -238,6 +245,42 @@ export interface RawEdge {
    * one class (`current_user`). `resolve.ts` records it so a chained receiver can
    * be walked one hop at a time. */
   rubyReturnsFor?: string;
+  /** Ruby only (M3b): what `rubyReturnsFor`'s method hands back — an INSTANCE of the
+   * named class, the class OBJECT, or an ActiveRecord `collection`. `has_many :posts`
+   * yields a CollectionProxy, which forwards class methods and scopes to `Post` and
+   * raises `NoMethodError` for its instance methods; `belongs_to :blog` yields one
+   * Blog. Treating both as "a Post"/"a Blog" is what made `blog.posts.publish`
+   * resolve to an instance method Ruby cannot reach. */
+  rubyReturnsKind?: RubyValueKind;
+  /** Ruby only (M3b): the return type came from ActiveRecord's finder vocabulary, so
+   * it holds only if the class really is a model. See `rubyRecvFinder`. */
+  rubyReturnsAssumesModel?: boolean;
+  /** Ruby only (M3b): what the receiver IS, not merely which class it names.
+   * `User` and `User.new` name the same class and answer disjoint sets of methods;
+   * see `RubyValueKind`. */
+  rubyRecvKind?: RubyValueKind;
+  /** Ruby only (M3b): the receiver's kind was read off ActiveRecord's finder of this
+   * name (`Widget.first` means "a Widget" only because AR says so). A plain Ruby
+   * class with its own `def self.first` means whatever its body returns, so
+   * resolve.ts tries that declaration first and falls back to AR's reading only for
+   * a class that actually descends from it. */
+  rubyRecvFinder?: string;
+  /** Ruby only (M3b): the association name this `references` edge was declared for
+   * (`has_many :posts` → `"posts"`). Turns the association edges into a registry
+   * resolve.ts can look associations up in, which is what following a `through:`
+   * requires. */
+  rubyAssocName?: string;
+  /** Ruby only (M3b): the `through:` association, when the declaration names one.
+   * Its target class is stated by the SOURCE reflection on the join model, not by
+   * this association's own name — `has_many :people, through: :memberships, source:
+   * :person` is a collection of `User` when `Membership` declares `belongs_to
+   * :person, class_name: "User"`. `name` carries Rails' own default inflection as
+   * the fallback for a join model that is not in this repo. */
+  rubyAssocThrough?: string;
+  /** Ruby only (M3b): the association names to look for on the join model, in the
+   * order Rails tries them — what `source:` names, or else the association's own
+   * name and its singular. */
+  rubyAssocSourceNames?: string[];
   /** Ruby only (M3): a carrier, not an edge. It exists to state a type and must
    * never reach the graph — the same role `rubyConstDecl` plays for shadowing
    * declarations. An INFERRED return type is not a reference anyone wrote: the
@@ -550,6 +593,28 @@ export interface WalkCtx {
   // generated node first, handing it the base id and pushing the real method to
   // `organization=~2`. Every existing reference to that method silently moved.
   rubyOwnDefs: ReadonlySet<string>;
+  // Ruby (M3b): the nearest enclosing class's SCOPE PATH, dotted exactly as
+  // bindings.ts stores it. `enclosingClass` is only the bare name, and an `@ivar`
+  // binding is filed under the full path — reconstructing it from `scope` at each
+  // call site is how the two walks drift apart.
+  rubyClassScope: string | null;
+  // Ruby (M3b): what `self` IS here — an instance of the enclosing class, or the
+  // class object. `def self.x`, `class << self` and a class body are all the class
+  // object, and it answers a different set of methods than an instance does. This
+  // is both the receiver kind of a bare `self` call and the slot an `@ivar` here
+  // belongs to.
+  rubySelfKind: RubySelfContext;
+  // Ruby (M3b): does a `def` in this body ALSO become a singleton method on the
+  // module? `module_function` and `extend self` both say yes, and 112 of dailywerk's
+  // service modules are written that way — `Tool::Denials.reject(...)` calls an
+  // ordinary `def reject` through it. Such a method answers BOTH chains, so it is
+  // emitted with no `receiver` at all rather than a claim to one.
+  rubyModuleFunction: boolean;
+  // Ruby (M3b): are we inside a concern's `class_methods do ... end`? `self` there is
+  // the INCLUDER CLASS at run time, so a bare call in one of its methods is a class
+  // method call — `requiring_workos_sync` calling the `scope :workos_pending_sync`
+  // its own concern declared is the shape, and reading `self` as an instance lost it.
+  rubyInClassMethods: boolean;
 }
 
 /** What the Ruby macro extractor needs to know about the surrounding Rails app. */
@@ -582,6 +647,7 @@ interface DefDescriptor {
   owner?: string;
   arity?: number; // declared parameter count — overload disambiguation (Java)
   variadic?: boolean; // last parameter is a vararg, so `arity` is a minimum
+  receiver?: RubySelfKind; // Ruby: instance method vs `def self.` — see NodeV1.receiver
 }
 
 /** tree-sitter's string `parse()` fails with "Invalid argument" on any input
@@ -597,7 +663,7 @@ function parseSource(source: string): Parser.SyntaxNode {
 export function extractFile(rel: string, source: string, lang: Language, opts: ExtractOptions = {}): ExtractResult {
   parser.setLanguage(GRAMMARS[lang] as never);
   const root = parseSource(source);
-  const bindings = collectBindings(root, lang);
+  const bindings = collectBindings(root, lang, opts.rails != null);
   const importedSymbols = collectImportedSymbols(root, lang);
   const rGenerics = lang === "r" ? collectRGenerics(root) : EMPTY_SET;
 
@@ -642,6 +708,10 @@ export function extractFile(rel: string, source: string, lang: Language, opts: E
     rubyRails: opts.rails ?? null,
     rubyIncludedBlock: false,
     rubyOwnDefs: EMPTY_SET,
+    rubyClassScope: null,
+    rubySelfKind: "instance",
+    rubyModuleFunction: false,
+    rubyInClassMethods: false,
   };
   // Every id minted this file, seeded with the file node's own id (`rel`) so a
   // top-level definition can never collide with it. Threaded as its own
@@ -778,6 +848,20 @@ function emitPhpCollapsedEnum(
 }
 
 function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEdge[], minted: Set<string>): void {
+  // A block written in a class body, whose method this pass does not recognize.
+  // minitest's `test "…" do … end` becomes an INSTANCE method; Rails' `included do …
+  // end` runs in the includer's class body; the syntax is identical and only the
+  // caller knows which. Reading every one of them as the class body dropped 927 real
+  // calls into dailywerk's own test helpers in a single run, so `self` here is
+  // declared unknown and the lookup tries both chains rather than picking one.
+  // Mirrors bindings.ts's rule exactly — see `RubySelfContext`. The blocks this pass
+  // DOES recognize (`included do`, `class_methods do`, a `scope` lambda, a
+  // `define_method` body) never reach here: each is consumed by a branch below that
+  // walks the block's CHILDREN with the reading it knows to be right.
+  if (ctx.lang === "ruby" && ctx.rubySelfKind === "class" && (node.type === "do_block" || node.type === "block")) {
+    walkNamedChildren(node.namedChildren, { ...ctx, rubySelfKind: "unknown" }, out, edges, minted);
+    return;
+  }
   const desc = describe(node, ctx);
   if (desc) {
     // `idName` scopes the id (e.g. a Go method under its receiver: `#DB.Count`) while
@@ -834,6 +918,7 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
       ...(owner !== undefined ? { owner } : {}),
       ...(desc.arity !== undefined ? { arity: desc.arity } : {}),
       ...(desc.variadic ? { variadic: true } : {}),
+      ...(desc.receiver !== undefined ? { receiver: desc.receiver } : {}),
     });
     // structural containment
     edges.push({ source: ctx.parentId, relation: "contains", targetId: id, file: ctx.rel });
@@ -917,21 +1002,45 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
         ctx.lang === "ruby" && (desc.kind === "class" || desc.kind === "module")
           ? false
           : ctx.rubyIncludedBlock,
+      // Mirrors bindings.ts's own walk exactly — the two scope stacks have to agree
+      // on the key an `@ivar` is filed under, and a divergence here is silent.
+      rubyClassScope:
+        ctx.lang === "ruby" && (desc.kind === "class" || desc.kind === "module")
+          ? [...ctx.scope, idPart].join(".")
+          : ctx.rubyClassScope,
+      // `extend self` applies to the whole module regardless of where it is written
+      // (verified: a `def` ABOVE it is reachable as a class method too), so it is
+      // pre-scanned when the body is entered. `module_function` is forward-only and
+      // is handled in the body walk, exactly as `private` is.
+      rubyModuleFunction:
+        ctx.lang === "ruby" && (desc.kind === "class" || desc.kind === "module")
+          ? rubyExtendsSelf(node)
+          : ctx.rubyModuleFunction,
+      rubySelfKind:
+        ctx.lang !== "ruby"
+          ? ctx.rubySelfKind
+          : desc.kind === "class" || desc.kind === "module" || node.type === "singleton_method"
+            ? "class"
+            : node.type === "method"
+              ? (rubyInSingletonClass(node) || ctx.rubyInClassMethods ? "class" : "instance")
+              : ctx.rubySelfKind,
     };
     // M3: a method whose every exit agrees on one class declares its own return
     // type, which is what lets `current_user.can_delete_account?` resolve — the
     // reader is hand-written, so no Rails macro states what it yields. A carrier,
     // never an edge; see `RawEdge.rubyTypeOnly`.
     if (ctx.lang === "ruby" && (desc.kind === "method" || desc.kind === "function")) {
-      const returns = rubyMethodReturnType(node, ctx.bindings, childCtx.scope);
+      const returns = rubyMethodReturnType(node, rubyTypeCtx(childCtx));
       if (returns) {
         edges.push({
           source: id,
           relation: "references",
-          name: returns,
+          name: returns.fqn,
           file: ctx.rel,
           nesting: [...ctx.rubyNesting],
           rubyReturnsFor: id,
+          rubyReturnsKind: returns.kind,
+          ...(returns.finder ? { rubyReturnsAssumesModel: true } : {}),
           rubyTypeOnly: true,
         });
       }
@@ -1030,6 +1139,29 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
       // An `ActiveSupport::Concern`'s `included do ... end`. Its body is ordinary
       // class-body syntax, so it is walked with the same ctx plus the marker that
       // sends whatever it declares to the concern's includers.
+      // `class_methods do ... end` in an ActiveSupport::Concern. Rails turns the block
+      // into a nested `module ClassMethods` and `extend`s that into every includer, so
+      // what it declares are the INCLUDER's class methods — not its instance methods,
+      // and not the concern's own singleton methods, which `include` never hands over.
+      // Filed under the name Rails itself gives the module, which is also where a
+      // hand-written `module ClassMethods` already lands, so one lookup finds both.
+      const classMethodsBody = ctx.rubyRails ? rubyClassMethodsBlock(node) : null;
+      if (classMethodsBody) {
+        const cmCtx: WalkCtx = {
+          ...ctx,
+          scope: [...ctx.scope, RUBY_CLASS_METHODS],
+          enclosingClass: RUBY_CLASS_METHODS,
+          // `rubyNesting` deliberately UNCHANGED: `class_methods do` is a block, not a
+          // lexical scope, so a constant written inside it resolves against the
+          // concern exactly as one written beside it does — and `rubyOwnerFqn` then
+          // names the concern, which is where its own macros are filed.
+          rubyClassScope: [...ctx.scope, RUBY_CLASS_METHODS].join("."),
+          rubyOwnDefs: EMPTY_SET,
+          rubyInClassMethods: true,
+        };
+        for (const child of classMethodsBody.namedChildren) walk(child, cmCtx, out, edges, minted);
+        return;
+      }
       const includedBody = ctx.rubyRails ? rubyIncludedDoBlock(node) : null;
       if (includedBody) {
         for (const child of includedBody.namedChildren) {
@@ -1057,7 +1189,12 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
           // not minted, so it gets no id and no declared type, which is right: a
           // hand-written `def posts` returns whatever its body returns.
           if (readerId) {
-            for (const me of macroEdges) if (me.relation === "references") me.rubyReturnsFor = readerId;
+            const macroName = node.childForFieldName("method")?.text ?? "";
+            for (const me of macroEdges) {
+              if (me.relation !== "references") continue;
+              me.rubyReturnsFor = readerId;
+              me.rubyReturnsKind = rubyAssociationKind(macroName);
+            }
           }
           edges.push(...macroEdges);
           edges.push(...rubyDelegateForwards(node, ctx, mintedIds));
@@ -1166,7 +1303,7 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
       file: ctx.rel,
       // `function` only — see rubyCallee's no-receiver branch for why.
       kinds: ["function"],
-      ...(own ? { rubyRecvBase: "self" as const, rubyOwnerFqn: own } : {}),
+      ...(own ? { rubyRecvBase: "self" as const, rubyOwnerFqn: own, rubyRecvKind: ctx.rubySelfKind } : {}),
       // A word standing alone as its own statement may still be a top-level
       // method, so it keeps the bare-name fallback. A word in RECEIVER position
       // does not: `foo.bar` where the class has no `foo` is a receiver this pass
@@ -1246,18 +1383,26 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
 
   if (ctx.lang === "ruby" && node.type === "body_statement") {
     let visibility = ctx.rubyVisibility;
+    let moduleFunction = ctx.rubyModuleFunction;
     for (const child of node.namedChildren) {
       const switchTo = rubyVisibilitySwitch(child);
       if (switchTo) {
         visibility = switchTo;
         continue;
       }
-      const inline = rubyInlineVisibility(child);
-      if (inline) {
-        walk(inline.methodNode, { ...ctx, rubyVisibility: inline.visibility }, out, edges, minted);
+      // A bare `module_function` applies to every `def` BELOW it and none above —
+      // verified on Ruby 3.4, where the method defined before it raises NoMethodError
+      // on the module. Same forward-only rule as `private`, so it rides the same walk.
+      if (child.type === "identifier" && child.text === "module_function") {
+        moduleFunction = true;
         continue;
       }
-      walk(child, { ...ctx, rubyVisibility: visibility }, out, edges, minted);
+      const inline = rubyInlineVisibility(child);
+      if (inline) {
+        walk(inline.methodNode, { ...ctx, rubyVisibility: inline.visibility, rubyModuleFunction: moduleFunction }, out, edges, minted);
+        continue;
+      }
+      walk(child, { ...ctx, rubyVisibility: visibility, rubyModuleFunction: moduleFunction }, out, edges, minted);
     }
     return;
   }
@@ -2164,6 +2309,14 @@ function describeRuby(node: Parser.SyntaxNode, ctx: WalkCtx): DefDescriptor | nu
       kind: ctx.enclosingClass !== null ? "method" : "function",
       headerEnd: (body ?? node).startIndex,
       hashNode: body ?? node,
+      // `def x` is an instance method — unless it is written inside `class << self`,
+      // which is Ruby's other spelling of `def self.x` and is how 312 of
+      // dailywerk's class methods are declared.
+      // `module_function`/`extend self` make the method answer BOTH chains, so it
+      // claims neither — an absent `receiver` is "unknown, matches either".
+      ...(ctx.enclosingClass !== null && !ctx.rubyModuleFunction
+        ? { receiver: (rubyInSingletonClass(node) ? "class" : "instance") as RubySelfKind }
+        : {}),
     };
   }
   if (node.type === "singleton_method") {
@@ -2175,11 +2328,14 @@ function describeRuby(node: Parser.SyntaxNode, ctx: WalkCtx): DefDescriptor | nu
       // Owned by the enclosing class regardless of whether the receiver was
       // `self` or an arbitrary object expression (`def obj.x`) — Phase 2's
       // scope is recognizing the shape, not modeling per-object singleton
-      // methods distinctly (no schema field exists for that distinction
-      // anyway; see Java's own static methods for precedent).
+      // methods distinctly.
       kind: "method",
       headerEnd: (body ?? node).startIndex,
       hashNode: body ?? node,
+      // `def self.x` answers a call on the class OBJECT. `def obj.x` for some other
+      // object answers neither reading of the enclosing class, so it is left
+      // unstamped — "unknown", which matches either rather than claiming one.
+      ...(rubySingletonIsSelf(node) ? { receiver: "class" as RubySelfKind } : {}),
     };
   }
   return null;
@@ -2284,6 +2440,27 @@ function rubyExported(name: string, ctx: WalkCtx): boolean {
  * inside a conditional or another method body is not a class-level
  * visibility declaration and should not be treated as one.
  */
+/**
+ * Does this module body contain a bare `extend self`?
+ *
+ * Unlike `module_function`, it is position-independent: `extend self` extends the
+ * module with its own instance methods, and Ruby resolves that at call time, so a
+ * `def` written ABOVE the line is reachable as a class method too (verified on Ruby
+ * 3.4). A pre-scan is therefore the only correct reading.
+ */
+function rubyExtendsSelf(classOrModuleNode: Parser.SyntaxNode): boolean {
+  const body = classOrModuleNode.childForFieldName("body");
+  if (!body) return false;
+  for (const stmt of body.namedChildren) {
+    if (stmt.type !== "call") continue;
+    if (stmt.childForFieldName("receiver")) continue;
+    if (stmt.childForFieldName("method")?.text !== "extend") continue;
+    const args = stmt.childForFieldName("arguments");
+    if (args?.namedChildren.some((a) => a.type === "self")) return true;
+  }
+  return false;
+}
+
 function rubyPostHocVisibility(classOrModuleNode: Parser.SyntaxNode): ReadonlyMap<string, "protected" | "private"> {
   const body = classOrModuleNode.childForFieldName("body");
   if (!body) return EMPTY_MAP;
@@ -2400,7 +2577,9 @@ const RUBY_RECV_CHAIN_CAP = 4;
 
 /** A receiver whose class M3 can name: a base (the enclosing class, or a constant)
  * plus the reader calls applied to it before the call in question. */
-type RubyReceiver = { base: "self"; steps: string[] } | { base: "const"; constPath: string; steps: string[] };
+type RubyReceiver =
+  | { base: "self"; kind: RubyValueKind; steps: string[] }
+  | { base: "const"; constPath: string; kind: RubyValueKind; finder?: string; steps: string[] };
 
 /**
  * The class of a Ruby receiver expression, or null when this pass cannot say —
@@ -2426,39 +2605,90 @@ type RubyReceiver = { base: "self"; steps: string[] } | { base: "const"; constPa
  * — is null, and the caller emits no edge at all.
  */
 function rubyReceiverType(node: Parser.SyntaxNode, ctx: WalkCtx): RubyReceiver | null {
-  if (node.type === "self") return { base: "self", steps: [] };
+  if (node.type === "self") return { base: "self", kind: ctx.rubySelfKind, steps: [] };
   if (node.type === "constant" || node.type === "scope_resolution") {
     const path = rubyConstPath(node);
-    return path === null ? null : { base: "const", constPath: path, steps: [] };
+    // The class OBJECT, not an instance of it. `Ledger.post` reaches `def self.post`
+    // and its `extend`ed modules; it does not reach `def post`.
+    return path === null ? null : { base: "const", constPath: path, kind: "class", steps: [] };
   }
   if (node.type === "identifier") {
-    const bound = ctx.bindings.lookup(ctx.scope, node.text);
-    if (bound) return { base: "const", constPath: bound, steps: [] };
+    const bound = rubyLookupVar(node, ctx);
+    if (bound) return { base: "const", constPath: bound.fqn, kind: bound.kind, finder: bound.finder, steps: [] };
     // A variable with no knowable type. NOT a call on self — reading it as one
     // would bind a parameter to a same-named accessor on its own class.
-    if (ctx.bindings.isRubyVar(ctx.scope, node.text)) return null;
-    return { base: "self", steps: [node.text] };
+    if (rubyIsVar(node, ctx)) return null;
+    return { base: "self", kind: ctx.rubySelfKind, steps: [node.text] };
   }
   if (node.type === "instance_variable" || node.type === "class_variable" || node.type === "global_variable") {
     // No `self` fallback here: an instance variable that was never assigned a
     // typeable value is `nil`, not a method.
-    const bound = ctx.bindings.lookup(ctx.scope, node.text);
-    return bound ? { base: "const", constPath: bound, steps: [] } : null;
+    const bound = rubyLookupVar(node, ctx);
+    return bound ? { base: "const", constPath: bound.fqn, kind: bound.kind, finder: bound.finder, steps: [] } : null;
   }
   if (node.type === "call") {
     const method = node.childForFieldName("method");
     if (method?.type !== "identifier") return null;
     const inner = node.childForFieldName("receiver");
+    // `User.new`, `User.find(1)` — a constructor or finder on a constant is an
+    // INSTANCE of it, and collapsing it here is what lets `Post.new.blog.publish`
+    // walk at all: as a bare step, `new` resolves to no node and the chain dies.
+    // The argument shape decides: `User.first(2)` is an Array, not a User.
+    if (inner && (inner.type === "constant" || inner.type === "scope_resolution")) {
+      const fqn = rubyConstPath(inner);
+      const built = fqn === null ? null : rubyConstructorType(fqn, method.text, node.childForFieldName("arguments"), rubyTypeCtx(ctx));
+      if (built) {
+        return { base: "const", constPath: built.fqn, kind: built.kind, finder: built.finder, steps: [] };
+      }
+    }
     const head: RubyReceiver | null = inner
       ? rubyReceiverType(inner, ctx)
-      : ctx.bindings.isRubyVar(ctx.scope, method.text)
+      : rubyIsVar(method, ctx)
         ? null
-        : { base: "self", steps: [] };
+        : { base: "self", kind: ctx.rubySelfKind, steps: [] };
     if (!head) return null;
     if (head.steps.length >= RUBY_RECV_CHAIN_CAP) return null;
     return { ...head, steps: [...head.steps, method.text] };
   }
   return null;
+}
+
+/** The binding-table question every Ruby receiver asks, with the scope key and the
+ * read position both taken from where the name actually sits. */
+function rubyLookupVar(node: Parser.SyntaxNode, ctx: WalkCtx): RubyType | null {
+  const key = rubyScopeKey(node.text, ctx.scope, ctx.rubyClassScope, ctx.rubySelfKind);
+  return ctx.bindings.lookupRuby(key, node.text, node.startIndex);
+}
+
+function rubyIsVar(node: Parser.SyntaxNode, ctx: WalkCtx): boolean {
+  const key = rubyScopeKey(node.text, ctx.scope, ctx.rubyClassScope, ctx.rubySelfKind);
+  return ctx.bindings.isRubyVar(key, node.text, node.startIndex);
+}
+
+/** The slice of `WalkCtx` bindings.ts's type questions need. */
+function rubyTypeCtx(ctx: WalkCtx): RubyTypeCtx {
+  return {
+    bindings: ctx.bindings,
+    scope: ctx.scope,
+    classScope: ctx.rubyClassScope,
+    selfKind: ctx.rubySelfKind,
+    rails: ctx.rubyRails !== null,
+  };
+}
+
+/** `def x` written inside a `class << self` block, which is how Ruby's other
+ * spelling of `def self.x` reaches the walk: `method` → `body_statement` →
+ * `singleton_class`. */
+function rubyInSingletonClass(node: Parser.SyntaxNode): boolean {
+  return node.parent?.parent?.type === "singleton_class";
+}
+
+/** Is this `def self.x`, as opposed to `def some_other_object.x`? Only the former
+ * puts a method on the enclosing class's singleton; the latter is a method on some
+ * runtime object this pass cannot name. */
+function rubySingletonIsSelf(node: Parser.SyntaxNode): boolean {
+  const obj = node.childForFieldName("object");
+  return obj?.type === "self";
 }
 
 /** The M3 receiver fields for a `RawEdge`, or null when the receiver's class is
@@ -2468,9 +2698,16 @@ function rubyRecvFields(recv: RubyReceiver, ctx: WalkCtx): Partial<RawEdge> | nu
   const steps = recv.steps.length > 0 ? { rubyRecvSteps: recv.steps } : {};
   if (recv.base === "self") {
     const own = ctx.rubyNesting[0];
-    return own ? { rubyRecvBase: "self", rubyOwnerFqn: own, ...steps } : null;
+    return own ? { rubyRecvBase: "self", rubyOwnerFqn: own, rubyRecvKind: recv.kind, ...steps } : null;
   }
-  return { rubyRecvBase: "const", rubyRecvConst: recv.constPath, nesting: [...ctx.rubyNesting], ...steps };
+  return {
+    rubyRecvBase: "const",
+    rubyRecvConst: recv.constPath,
+    nesting: [...ctx.rubyNesting],
+    rubyRecvKind: recv.kind,
+    ...(recv.finder ? { rubyRecvFinder: recv.finder } : {}),
+    ...steps,
+  };
 }
 
 /**
@@ -2519,7 +2756,7 @@ function rubyCallee(
       name,
       viaMember: false,
       kinds: ["function"],
-      ruby: { rubyRecvBase: "self", rubyOwnerFqn: own, implicitSelf: true },
+      ruby: { rubyRecvBase: "self", rubyOwnerFqn: own, rubyRecvKind: ctx.rubySelfKind, implicitSelf: true },
     };
   }
   const recv = rubyReceiverType(receiverNode, ctx);
@@ -2563,6 +2800,11 @@ interface RubySynthesizedMethod {
   name: string;
   hashNode: Parser.SyntaxNode; // span for signature/body_hash/body_text
   headerEnd: number;
+  /** What a call must hold to reach it — see `NodeV1.receiver`. Almost every macro
+   * declares instance methods; `scope` declares a CLASS method, and
+   * `ActiveSupport::CurrentAttributes`' `attribute` genuinely declares both, so it
+   * leaves this undefined rather than claiming one. */
+  receiver?: RubySelfKind;
 }
 
 /**
@@ -2765,7 +3007,7 @@ function rubyMacroMethods(node: Parser.SyntaxNode, ctx: WalkCtx): RubySynthesize
   const macro = methodNode.text;
   const args = node.childForFieldName("arguments");
   const syms = rubySymbolArgs(args);
-  const at = (name: string): RubySynthesizedMethod => ({ name, hashNode: node, headerEnd: node.startIndex });
+  const at = (name: string): RubySynthesizedMethod => ({ name, hashNode: node, headerEnd: node.startIndex, receiver: "instance" });
 
   if (AR_ASSOCIATIONS.has(macro)) {
     const name = syms[0];
@@ -2797,9 +3039,12 @@ function rubyMacroMethods(node: Parser.SyntaxNode, ctx: WalkCtx): RubySynthesize
     const body = rubyLambdaBody(args);
     const name = macro === "default_scope" ? "default_scope" : syms[0];
     if (!name) return [];
+    // A scope is a CLASS method: `Post.recent`, never `post.recent`. It is also what
+    // a `has_many` collection proxy forwards, which is why `blog.posts.recent`
+    // resolves while `blog.posts.publish` does not.
     return body
-      ? [{ name, hashNode: body, headerEnd: body.startIndex }]
-      : [at(name)];
+      ? [{ name, hashNode: body, headerEnd: body.startIndex, receiver: "class" as RubySelfKind }]
+      : [{ ...at(name), receiver: "class" as RubySelfKind }];
   }
   if (macro === "attribute") {
     // Two macros share this name and they disagree about their own arguments.
@@ -2812,8 +3057,14 @@ function rubyMacroMethods(node: Parser.SyntaxNode, ctx: WalkCtx): RubySynthesize
     //
     // The types are a closed, known set, so the trailing symbols answer it: all of
     // them types means the ActiveRecord form, anything else means they are names.
-    const names = syms.length > 1 && syms.slice(1).every((t) => AR_CAST_TYPES.has(t)) ? syms.slice(0, 1) : syms;
-    return names.flatMap((n) => [at(n), at(`${n}=`)]);
+    const isActiveRecordForm = syms.length > 1 && syms.slice(1).every((t) => AR_CAST_TYPES.has(t));
+    const names = isActiveRecordForm ? syms.slice(0, 1) : syms;
+    // ActiveRecord's `attribute :price, :decimal` declares an instance accessor.
+    // CurrentAttributes' `attribute :user` declares BOTH — `Current.user` delegates
+    // to `Current.instance.user` — and `Current.user` is one of the most-called
+    // receivers in a Rails app. Neither reading is wrong, so it claims neither.
+    const recv: RubySelfKind | undefined = isActiveRecordForm ? "instance" : undefined;
+    return names.flatMap((n) => [{ ...at(n), receiver: recv }, { ...at(`${n}=`), receiver: recv }]);
   }
   if (macro === "store_accessor") {
     // `store_accessor :settings, :theme, prefix: true` defines `settings_theme`, NOT
@@ -2869,6 +3120,25 @@ function rubyMacroMethods(node: Parser.SyntaxNode, ctx: WalkCtx): RubySynthesize
 
 /** The reader method an association macro generates — the name its extension block's
  * methods hang off. Null for any other macro, which never takes one. */
+/** The scope segment `class_methods do` contributes — the name Rails gives the
+ * module it builds. Shared with bindings.ts's own walk, which must push the same
+ * segment or every binding inside the block is filed where nothing looks. */
+export const RUBY_CLASS_METHODS = "ClassMethods";
+
+/** `class_methods do ... end` (bare, with a block) → the block's body. */
+function rubyClassMethodsBlock(node: Parser.SyntaxNode): Parser.SyntaxNode | null {
+  const m = node.childForFieldName("method");
+  if (m?.type !== "identifier" || m.text !== "class_methods" || node.childForFieldName("receiver")) return null;
+  const block = node.childForFieldName("block");
+  return block?.type === "do_block" || block?.type === "block" ? (block.childForFieldName("body") ?? block) : null;
+}
+
+/** Whether an association hands back ONE record or a collection proxy. The proxy is
+ * a different object with a different method set — see `RawEdge.rubyReturnsKind`. */
+function rubyAssociationKind(macro: string): RubyValueKind {
+  return macro === "belongs_to" || macro === "has_one" ? "instance" : "collection";
+}
+
 function rubyAssociationReader(node: Parser.SyntaxNode): string | null {
   const methodNode = node.childForFieldName("method");
   if (methodNode?.type !== "identifier" || !AR_ASSOCIATIONS.has(methodNode.text)) return null;
@@ -2930,6 +3200,57 @@ function rubyAssociationTarget(
  * `classId` is the enclosing class/module node — the declaration site, which is what
  * a `callers` query on an association should surface.
  */
+/**
+ * The scopes Rails searches for an association's class, which are NOT the ones Ruby
+ * searches for a bare constant.
+ *
+ * `ActiveRecord::Inheritance#compute_type` walks the MODEL's own namespace: for
+ * `Admin::Post` and a `:user` association it tries `Admin::Post::User`, then
+ * `Admin::User`, then `::User`. Ruby's lexical nesting for the compact spelling
+ * `class Admin::Post` is just `["Admin::Post"]` — `Admin` is not in it — so the two
+ * disagree exactly when a namespaced model shadows a top-level one, which is the
+ * case the compact form makes common. Verified against ActiveRecord 8.1: the
+ * association resolves to `Admin::User`, and M3's lexical lookup answered `::User`.
+ */
+function rubyAssocNesting(ctx: WalkCtx): string[] {
+  const own = ctx.rubyNesting[0];
+  if (!own) return [...ctx.rubyNesting];
+  const segs = own.split("::");
+  const out: string[] = [];
+  for (let i = segs.length; i > 0; i--) out.push(segs.slice(0, i).join("::"));
+  return out;
+}
+
+/**
+ * What resolve.ts needs to FOLLOW a `through:` association instead of guessing at it.
+ *
+ * `has_many :people, through: :memberships, source: :person` names no class. Rails
+ * reads the `person` reflection on `Membership`, and if that declares `class_name:
+ * "User"` the collection is of `User` — verified against ActiveRecord 8.1, where an
+ * unrelated `Person` model also existed and was NOT the answer. M2 inflected
+ * `source:` directly and referenced `Person`.
+ *
+ * Empty when the declaration already names its class outright (`class_name:`,
+ * `source_type:`), or when `through:`/`source:` is written as something this pass
+ * cannot read.
+ */
+function rubyThroughFields(name: string, args: Parser.SyntaxNode | null, ctx: WalkCtx): Partial<RawEdge> {
+  if (rubyMacroOption(args, "class_name") || rubyMacroName(args, "source_type")) return {};
+  const through = rubyMacroOption(args, "through");
+  if (!through || typeof through.value !== "string") return {};
+  const source = rubyMacroOption(args, "source");
+  if (source && typeof source.value !== "string") return {};
+  // Rails looks for an association named `:tags`, then `:tag`, on the join model —
+  // the same fallback pair its own `source_reflection_name` tries.
+  const singular = associationConstant(name, ctx.rubyRails!.acronyms)
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase();
+  return {
+    rubyAssocThrough: through.value,
+    rubyAssocSourceNames: source ? [source.value as string] : [name, singular],
+  };
+}
+
 function rubyMacroEdges(node: Parser.SyntaxNode, ctx: WalkCtx, classId: string): RawEdge[] {
   const methodNode = node.childForFieldName("method");
   if (methodNode?.type !== "identifier" || node.childForFieldName("receiver")) return [];
@@ -2943,7 +3264,9 @@ function rubyMacroEdges(node: Parser.SyntaxNode, ctx: WalkCtx, classId: string):
     if (target) {
       out.push({
         source: classId, relation: "references", name: target, file: ctx.rel,
-        nesting: [...ctx.rubyNesting], // resolved by M1's constant resolver, never by bare name
+        nesting: rubyAssocNesting(ctx), // Rails' namespace walk, not Ruby's lexical nesting
+        rubyAssocName: syms[0],
+        ...rubyThroughFields(syms[0], args, ctx),
         // Declared inside an `included do`, this association belongs to each class
         // that includes the concern, exactly as a callback declared there does.
         ...(ctx.rubyIncludedBlock ? { viaConcern: true } : {}),
@@ -3029,6 +3352,9 @@ function rubyDelegateForwards(
       viaMember: true,
       rubyRecvBase: "self",
       rubyOwnerFqn: own,
+      // `delegate :x, to: :y` writes `def x; y.x; end` — an instance method calling a
+      // reader on the same instance.
+      rubyRecvKind: "instance",
       rubyRecvSteps: [to],
     });
   }
@@ -3080,6 +3406,7 @@ function emitRubySynthesizedMethod(
     summary: null,
     crux: null,
     owner: ctx.enclosingClass ?? undefined,
+    ...(m.receiver !== undefined ? { receiver: m.receiver } : {}),
   });
   edges.push({ source: ctx.parentId, relation: "contains", targetId: id, file: ctx.rel });
   // define_method's block body can contain further calls/definitions — walk
@@ -3093,6 +3420,12 @@ function emitRubySynthesizedMethod(
       scope: [...ctx.scope, m.name],
       enclosingKind: "method",
       parentId: id,
+      // What `self` is inside the block, which decides what a bare word there can
+      // reach. A `scope`'s lambda runs on the class — `scope :recent, -> { where(…) }`
+      // — while a `define_method` block runs on an instance. Inheriting the class
+      // body's reading for both would look every bare call in a `define_method` up
+      // among the class methods.
+      rubySelfKind: m.receiver ?? "instance",
     };
     for (const child of m.hashNode.namedChildren) walk(child, childCtx, out, edges, minted);
   }
@@ -3129,7 +3462,7 @@ function rubyBareCallPosition(node: Parser.SyntaxNode, ctx: WalkCtx): boolean {
   const parent = node.parent;
   if (!parent) return false;
   if (!rubyIsValuePosition(node, parent)) return false;
-  return !ctx.bindings.isRubyVar(ctx.scope, node.text);
+  return !rubyIsVar(node, ctx);
 }
 
 /**

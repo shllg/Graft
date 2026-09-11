@@ -684,19 +684,18 @@ test("rails macros: has_many :through resolves via source:, not via its own name
   );
 });
 
-test("rails macros: a bare has_many :through still uses the name's own implication", async () => {
-  // The recall half of the `through:` rule, and the reason it is narrow. Without
-  // `source:`, Rails looks for `:users`/`:user` on the through-class and lands on
-  // `User` — the same answer the plural implies. Declining the whole bare form cost
-  // real edges (`has_many :tags, through: :document_tags` among them) to guard a
-  // redirect that only `source:` can express.
+test("rails macros: a bare has_many :through is FOLLOWED to the source reflection", async () => {
+  // The recall half of the `through:` rule. Without `source:`, Rails looks for
+  // `:users` then `:user` on the through-class — so the answer comes from
+  // `Membership`'s own declaration, not from inflecting the plural. Here the two
+  // agree; `graph-ruby-dispatch.test.ts` covers the case where they do not.
   await withGraph(
     {
       ...RAILS,
       "app/models/team.rb":
         `class Team < ApplicationRecord\n  has_many :memberships\n  has_many :users, through: :memberships\nend\n`,
       "app/models/user.rb": `class User < ApplicationRecord\nend\n`,
-      "app/models/membership.rb": `class Membership < ApplicationRecord\nend\n`,
+      "app/models/membership.rb": `class Membership < ApplicationRecord\n  belongs_to :user\nend\n`,
     },
     (g) => {
       assert.deepEqual(
@@ -705,6 +704,29 @@ test("rails macros: a bare has_many :through still uses the name's own implicati
           .map((e) => e.target)
           .sort(),
         ["app/models/membership.rb#Membership", "app/models/user.rb#User"],
+      );
+    },
+  );
+});
+
+test("rails macros: a through: whose join model is outside the repo keeps Rails' own default", async () => {
+  // The join model is a gem's, so nothing here could have stated a `class_name:`
+  // override — and Rails' own fallback IS the inflected name. Declining instead
+  // was measured to cost real edges (`has_many :tags, through: :document_tags`
+  // among them) to guard a redirect that cannot exist.
+  await withGraph(
+    {
+      ...RAILS,
+      "app/models/team.rb":
+        `class Team < ApplicationRecord\n  has_many :users, through: :audits\nend\n`,
+      "app/models/user.rb": `class User < ApplicationRecord\nend\n`,
+    },
+    (g) => {
+      assert.deepEqual(
+        g.edges
+          .filter((e) => e.relation === "references" && e.source === "app/models/team.rb#Team")
+          .map((e) => e.target),
+        ["app/models/user.rb#User"],
       );
     },
   );

@@ -103,6 +103,14 @@ export interface NodeV1 {
   //                 languages that do not emit it — resolution then behaves as before.
   variadic?: boolean; // the last parameter is a vararg (`String... xs`), so the declared
   //                 arity is a MINIMUM, not an equality. Never arity-filtered out.
+  // What a call must hold to reach this method: an INSTANCE of the owner
+  // (`def x`), or the CLASS OBJECT itself (`def self.x`, `class << self`). Ruby
+  // files both under one id — `Child#fire` and `Child.fire` are the same string —
+  // and a receiver-typed resolver that cannot tell them apart answers `Child.fire`
+  // with the instance method when Ruby reaches the INHERITED `Parent.fire`.
+  // Emitted for Ruby only, and absent on graphs built before it: consumers must
+  // read "absent" as "unknown, matches either", never as "instance".
+  receiver?: "instance" | "class";
 
   // meaning (Tier-2, one LLM call)
   summary_state: SummaryState;

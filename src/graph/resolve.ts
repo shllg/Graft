@@ -16,6 +16,7 @@ import { posix } from "node:path";
 import { toPosixPath } from "../util/paths.js";
 import type { EdgeV1, Kind, NodeV1, Relation } from "./types.js";
 import { languageOf, type RawEdge } from "./extract.js";
+import type { RubySelfKind, RubyType, RubyValueKind } from "./bindings.js";
 import { genericLangOf } from "./generic.js";
 import { isAutoloadHome, type ZeitwerkMap } from "./zeitwerk.js";
 
@@ -222,17 +223,23 @@ export function resolveEdges(
   // then the class itself, then `include`s (reverse declaration order), then the
   // superclass. `extend` is absent by design — it composes the SINGLETON class, and
   // constant lookup walks `cref.ancestors`, which `extend` never touches.
-  const rubyAncestors = new Map<string, string[]>();
+  const rubyHeritage = new Map<string, RubyHeritage>();
   const rubyIncluders = new Map<string, string[]>();
-  const NO_ANCESTORS = new Map<string, string[]>();
+  const NO_HERITAGE = new Map<string, RubyHeritage>();
+  // The superclass as WRITTEN, resolved or not. `class User < ApplicationRecord`
+  // resolves; `class ApplicationRecord < ActiveRecord::Base` does not, because
+  // ActiveRecord is a gem and has no node here — and that unresolvable name is
+  // exactly the evidence that the chain reaches a model. See `rubyModels`.
+  const rubySuperNames = new Map<string, string[]>();
   const heritageByOwner = new Map<string, { kind: RawEdge["rubyHeritage"]; fqn: string; id: string }[]>();
   for (const e of rawEdges) {
     if (e.relation !== "extends" || !e.name || !e.nesting) continue;
     const ownFqn = rubyFqnOf(e.source);
     if (!ownFqn) continue;
-    const hit = resolveRubyConstant(e.name, e.nesting, e.file, rubyFqn, NO_ANCESTORS, rubyShadow, zeitwerk, false);
-    const parentFqn = hit ? rubyFqnOf(hit.id) : null;
-    if (!hit || !parentFqn) continue;
+    if (e.rubyHeritage === "superclass" || e.rubyHeritage === undefined) push(rubySuperNames, ownFqn, e.name);
+    const hit = resolveRubyConstant(e.name, e.nesting, e.file, rubyFqn, NO_HERITAGE, rubyShadow, zeitwerk, false);
+    const parentFqn = hit && hit !== "stopped" ? rubyFqnOf(hit.id) : null;
+    if (!hit || hit === "stopped" || !parentFqn) continue;
     push(heritageByOwner, ownFqn, { kind: e.rubyHeritage, fqn: parentFqn, id: e.source });
     // The inverse edge, for M2: which classes include this concern. A declaration
     // inside an `included do` block runs in each of them, so this is the list its
@@ -243,15 +250,32 @@ export function resolveEdges(
   for (const [ownFqn, entries] of heritageByOwner) {
     const kindOf = (k: RawEdge["rubyHeritage"]) => entries.filter((x) => x.kind === k).map((x) => x.fqn);
     // A graph built before `rubyHeritage` existed tags nothing; those edges keep
-    // their emission order rather than being silently reordered into a guess.
+    // their emission order rather than being silently reordered into a guess, and
+    // are read as `include`s — the commonest of the three and the only one that
+    // affects neither the head nor the tail of the linearization.
     const untagged = entries.filter((x) => x.kind === undefined).map((x) => x.fqn);
-    rubyAncestors.set(ownFqn, [
-      ...kindOf("prepend").reverse(),
-      ...kindOf("include").reverse(),
-      ...kindOf("superclass"),
-      ...untagged,
-    ]);
+    rubyHeritage.set(ownFqn, {
+      prepends: kindOf("prepend").reverse(),
+      includes: [...kindOf("include").reverse(), ...untagged],
+      supers: kindOf("superclass"),
+      extends: kindOf("extend").reverse(),
+    });
   }
+  // Which classes are ActiveRecord models — the precondition for reading `first`,
+  // `find` and `create` as the framework's finders rather than as somebody's own
+  // class method. Closed over the resolved superclass chain AND the unresolved
+  // name at its end, since the chain always terminates in a gem.
+  const rubyModels = collectRubyDescendants(rubyHeritage, rubySuperNames, AR_BASE_NAMES);
+  // The classes whose class-level calls fall through to an instance. See
+  // `AS_CURRENT_ATTRIBUTES_NAMES`.
+  const rubyDelegating = collectRubyDescendants(rubyHeritage, rubySuperNames, AS_CURRENT_ATTRIBUTES_NAMES);
+  const rubyModuleFqns = new Set<string>();
+  for (const [fqn, cands] of rubyFqn) if (cands.some((c) => c.kind === "module")) rubyModuleFqns.add(fqn);
+  const rubyDispatch: RubyDispatch = {
+    heritage: rubyHeritage,
+    delegatesToInstance: rubyDelegating,
+    modules: rubyModuleFqns,
+  };
 
   // M3: declared RETURN types, keyed by the method node whose call yields them.
   // Only Rails' association macros declare one — `has_many :posts` says that
@@ -262,15 +286,71 @@ export function resolveEdges(
   // includes it: the ancestor walk finds the concern's own reader node, which is
   // the id recorded here.
   //
-  // Runs after `rubyAncestors` because naming the target class is itself a
+  // Runs after `rubyHeritage` because naming the target class is itself a
   // constant lookup, and that lookup walks ancestors.
-  const rubyReturns = new Map<string, string>();
+  //
+  // The KIND travels with the class. `has_many :posts` hands back a CollectionProxy,
+  // which forwards class methods and scopes to `Post` and raises NoMethodError for
+  // its instance methods; `belongs_to :blog` hands back one Blog. M3 recorded only
+  // the class name, so `blog.posts.publish` resolved to an instance method the
+  // collection cannot reach.
+  const rubyReturns = new Map<string, RubyType>();
   for (const e of rawEdges) {
     if (!e.rubyReturnsFor || !e.name || !e.nesting) continue;
-    const hit = resolveRubyConstant(e.name, e.nesting, e.file, rubyFqn, rubyAncestors, rubyShadow, zeitwerk, true);
+    const hit = constNode(resolveRubyConstant(e.name, e.nesting, e.file, rubyFqn, rubyHeritage, rubyShadow, zeitwerk, true));
     const target = hit ? rubyFqnOf(hit.id) : null;
-    if (target) rubyReturns.set(e.rubyReturnsFor, target);
+    if (!target) continue;
+    // A return type inferred through ActiveRecord's finder vocabulary — `def latest;
+    // User.first; end` — is only true if `User` is a model. When it is not, the method
+    // declares nothing this pass can use, which is the honest answer.
+    if (e.rubyReturnsAssumesModel && !rubyModels.has(target)) continue;
+    rubyReturns.set(e.rubyReturnsFor, { fqn: target, kind: e.rubyReturnsKind ?? "instance" });
   }
+
+  // M3b: the association registry — every `has_many`/`belongs_to` that names its class
+  // directly, keyed by the model it was declared on. Built so a `through:` can be
+  // FOLLOWED rather than inflected: `has_many :people, through: :memberships, source:
+  // :person` is a collection of whatever `Membership`'s `person` reflection says, and
+  // when that declares `class_name: "User"` the plural's own implication — `Person` —
+  // is a different model that happens to exist.
+  const rubyAssoc = new Map<string, string>();
+  for (const e of rawEdges) {
+    if (e.relation !== "references" || !e.rubyAssocName || e.rubyAssocThrough || !e.name || !e.nesting) continue;
+    const owner = rubyFqnOf(e.source);
+    if (!owner) continue;
+    const hit = constNode(resolveRubyConstant(e.name, e.nesting, e.file, rubyFqn, rubyHeritage, rubyShadow, zeitwerk, true, "fqn"));
+    const target = hit ? rubyFqnOf(hit.id) : null;
+    if (target) rubyAssoc.set(`${owner}#${e.rubyAssocName}`, target);
+  }
+  /** The class one of `names` is an association to, on `ownerFqn` or anything it
+   * inherits or includes — a concern declaring `belongs_to :user` answers for every
+   * model that includes it. */
+  const lookupAssoc = (ownerFqn: string, names: readonly string[]): string | null => {
+    for (const scope of rubyLinearize(ownerFqn, rubyHeritage).chain) {
+      for (const n of names) {
+        const hit = rubyAssoc.get(`${scope}#${n}`);
+        if (hit) return hit;
+      }
+    }
+    return null;
+  };
+  /**
+   * The class a `through:` association really names, as an absolute constant path —
+   * or `null` to decline, or the edge's own inflected fallback.
+   *
+   * The fallback is kept for exactly one case: a join model that is not in this repo.
+   * Nothing there can declare a `class_name:` override this pass could have read, and
+   * Rails' own default is then the inflection the macro already carries. When the join
+   * model IS here, its declarations are the authority — a source reflection we cannot
+   * find on it means Rails would raise, not that the guess is right.
+   */
+  const rubyThroughTarget = (e: RawEdge): string | null => {
+    const owner = rubyFqnOf(e.source);
+    const join = owner ? lookupAssoc(owner, [e.rubyAssocThrough!]) : null;
+    if (!join) return e.name!;
+    const followed = lookupAssoc(join, e.rubyAssocSourceNames ?? []);
+    return followed === null ? null : `::${followed}`;
+  };
 
   // classParents: class/interface name → its declared base-class names, from raw
   // `extends` edges (source id's own name → the base name). Used to walk up an
@@ -372,8 +452,13 @@ export function resolveEdges(
       // globally unique. It declines rather than guesses, and then M0's own
       // resolution runs unchanged — so nothing this cannot answer regresses.
       const constHit = e.nesting
-        ? resolveRubyConstant(e.name!, e.nesting, e.file, rubyFqn, rubyAncestors, rubyShadow, zeitwerk, true)
+        ? resolveRubyConstant(e.name!, e.nesting, e.file, rubyFqn, rubyHeritage, rubyShadow, zeitwerk, true)
         : null;
+      // A search that STOPPED found the name and could not turn it into a node. The
+      // bare-name ladder below would then answer with a different constant entirely —
+      // measured: `include Actual` inside a `Scope` that assigns its own `Actual`
+      // acquired an `extends` edge to the unrelated top-level module. Emit nothing.
+      if (constHit === "stopped") continue;
       const hit = constHit ?? resolveName(e.name!, e.file, kinds, perFileName, globalName);
       // an unresolved base is usually an external/imported type — keep the name.
       add(e.source, hit?.id ?? e.name!, e.relation, hit?.confidence ?? "inferred");
@@ -397,7 +482,9 @@ export function resolveEdges(
         // `references` target that is not a node id would put `ActiveRecord::Base`
         // into the graph as a phantom, and `graph-quality --strict` counts
         // dangling endpoints for exactly that reason.
-        const hit = resolveRubyConstant(e.name, e.nesting, e.file, rubyFqn, rubyAncestors, rubyShadow, zeitwerk, true);
+        const constRef = e.rubyAssocThrough ? rubyThroughTarget(e) : e.name;
+        if (constRef === null) continue;
+        const hit = constNode(resolveRubyConstant(constRef, e.nesting, e.file, rubyFqn, rubyHeritage, rubyShadow, zeitwerk, true));
         if (!hit) continue;
         if (hit.id !== e.source) add(e.source, hit.id, "references", hit.confidence);
         // An association declared inside an `included do` is also each INCLUDER's —
@@ -423,7 +510,7 @@ export function resolveEdges(
         // has no node anywhere; that is the correct answer, not a gap.
         for (const [subject, ownerFqn, subjFile] of rubyMacroSubjects(e)) {
           const hit = ownerFqn
-            ? resolveRubyOwnerMethod(ownerFqn, e.name, subjFile, rubyOwnerMethod, rubyAncestors)
+            ? resolveRubyOwnerMethod(ownerFqn, e.name, subjFile, rubyOwnerMethod, rubyDispatch)
             : resolveTypedMember(e.recvType, e.name, subjFile, ownerMethod, classParents, classTraits);
           if (hit && hit !== "ambiguous" && hit.id !== subject) add(subject, hit.id, "references", hit.confidence);
         }
@@ -462,7 +549,7 @@ export function resolveEdges(
       if (e.rubyRecvBase) {
         // M3: the receiver's type is known, so the method is looked up on that
         // class and its own Ruby ancestors — never by name across the repo.
-        const hit = resolveRubyTypedCall(e, rubyOwnerMethod, rubyAncestors, rubyReturns, rubyFqn, rubyShadow, zeitwerk);
+        const hit = resolveRubyTypedCall(e, rubyOwnerMethod, rubyDispatch, rubyReturns, rubyModels, rubyFqn, rubyShadow, zeitwerk);
         if (hit === "ambiguous") continue; // several owners, none decidable — drop
         if (hit) {
           if (hit.id !== e.source) add(e.source, hit.id, "calls", "type_bound");
@@ -488,7 +575,7 @@ export function resolveEdges(
         // of those are the right answer for that class.
         for (const [subject, ownerFqn, subjFile] of rubyMacroSubjects(e)) {
           const hit = ownerFqn
-            ? resolveRubyOwnerMethod(ownerFqn, e.name!, subjFile, rubyOwnerMethod, rubyAncestors)
+            ? resolveRubyOwnerMethod(ownerFqn, e.name!, subjFile, rubyOwnerMethod, rubyDispatch)
             : resolveTypedMember(e.recvType!, e.name!, subjFile, ownerMethod, classParents, classTraits, e.argCount);
           if (hit && hit !== "ambiguous" && hit.id !== subject) add(subject, hit.id, "calls", hit.confidence);
         }
@@ -675,21 +762,25 @@ function resolveRubyConstant(
   nesting: readonly string[],
   file: string,
   fqnIndex: Map<string, NodeV1[]>,
-  ancestors: Map<string, string[]>,
+  heritage: ReadonlyMap<string, RubyHeritage>,
   shadow: ReadonlySet<string>,
   zeitwerk: ZeitwerkMap | null,
   useAncestors: boolean,
   want: "node" | "fqn" = "node",
-): { id: string; confidence: EdgeV1["confidence"] } | null {
+): RubyConstHit {
   const absolute = ref.startsWith("::");
   const bare = absolute ? ref.slice(2) : ref;
   const segments = bare.split("::");
-  const anc = absolute || !useAncestors ? { prefixes: [], truncated: false } : ancestorPrefixes(nesting[0], ancestors);
+  // Ruby's own order, so a constant that two ancestors both declare resolves to the
+  // one Ruby would reach. The cref itself is already `nesting[0]`, so it is dropped
+  // here: `Module.nesting` is searched in full BEFORE any ancestor.
+  const lin = absolute || !useAncestors ? { chain: [], truncated: false } : rubyLinearize(nesting[0], heritage);
+  const anc = { prefixes: lin.chain.filter((x) => x !== nesting[0]), truncated: lin.truncated };
   // A walk that ran out of budget did not prove the constant is absent from the
   // chain, so it may not fall through to the top level and answer a different
   // question. Decline instead — the whole point of step 2 is that step 3 is only
   // correct once step 2 has been exhausted.
-  if (anc.truncated) return null;
+  if (anc.truncated) return "stopped";
   const prefixes = absolute ? [""] : [...nesting, ...anc.prefixes, ""];
 
   /** One lookup at one fully-qualified name, honouring shadowing declarations. */
@@ -715,12 +806,17 @@ function resolveRubyConstant(
     const headFqn = prefix ? `${prefix}::${segments[0]}` : segments[0];
     if (segments.length === 1) {
       const head = at(headFqn);
-      if (head === "ambiguous") return null; // found here, but undecidable — never guess past it
+      // Found here, but undecidable. Ruby's search ENDS at the first scope that
+      // declares the name, so there is nothing further to try — and the caller must
+      // not read this as "absent" and fall through to a bare-name match, which is how
+      // `include Actual` inside `Scope`, shadowed by `Scope::Actual = Module.new`,
+      // acquired an `extends` edge to the unrelated top-level `Actual`.
+      if (head === "ambiguous") return "stopped";
       if (head) return head;
       continue;
     }
     if (!declares(headFqn)) continue;
-    return resolveRubyQualified(headFqn, segments.slice(1), at, declares, ancestors);
+    return resolveRubyQualified(headFqn, segments.slice(1), at, declares, heritage);
   }
 
   // The head names nothing in the graph — an implicit Zeitwerk namespace, a gem, or
@@ -730,10 +826,29 @@ function resolveRubyConstant(
   for (const prefix of prefixes) {
     const fqn = prefix ? `${prefix}::${bare}` : bare;
     const hit = at(fqn);
-    if (hit === "ambiguous") return null;
+    if (hit === "ambiguous") return "stopped";
     if (hit) return hit;
   }
   return null;
+}
+
+/**
+ * What a Ruby constant lookup can answer, and why the third value exists.
+ *
+ * `null` means "nothing in this repo declares it" — a gem, stdlib, an implicit
+ * Zeitwerk namespace — and a caller may reasonably fall back to something weaker.
+ * `"stopped"` means Ruby's search ENDED here without producing a node: the name is
+ * declared at this scope but by an assignment with no definition of its own, or by
+ * two files this cannot choose between, or the ancestor walk ran out of budget
+ * before it could prove absence. Falling back after `"stopped"` answers a different
+ * question than the one the source asked.
+ */
+type RubyConstHit = { id: string; confidence: EdgeV1["confidence"] } | "stopped" | null;
+
+/** The node behind a constant hit, or null for "no usable answer" — collapsing the
+ * two negative cases where the caller genuinely treats them alike. */
+function constNode(hit: RubyConstHit): { id: string; confidence: EdgeV1["confidence"] } | null {
+  return hit && hit !== "stopped" ? hit : null;
 }
 
 /**
@@ -751,35 +866,293 @@ function resolveRubyQualified(
   tail: readonly string[],
   at: (fqn: string) => { id: string; confidence: EdgeV1["confidence"] } | "ambiguous" | null,
   declares: (fqn: string) => boolean,
-  ancestors: Map<string, string[]>,
-): { id: string; confidence: EdgeV1["confidence"] } | null {
+  heritage: ReadonlyMap<string, RubyHeritage>,
+): RubyConstHit {
   let cur = headFqn;
   for (let i = 0; i < tail.length; i++) {
-    const walk = ancestorPrefixes(cur, ancestors);
-    if (walk.truncated) return null;
-    const scopes = [cur, ...walk.prefixes];
+    const walk = rubyLinearize(cur, heritage);
+    if (walk.truncated) return "stopped";
+    const scopes = walk.chain;
     const rest = tail.slice(i).join("::");
     for (const scope of scopes) {
       const whole = at(`${scope}::${rest}`);
-      if (whole === "ambiguous") return null;
+      if (whole === "ambiguous") return "stopped";
       if (whole) return whole;
     }
     // Not the terminal, so existence is enough — same reason as `declares`.
     const next = scopes.map((s) => `${s}::${tail[i]}`).find(declares);
-    if (!next) return null; // Ruby raises NameError here; the graph declines
+    if (!next) return "stopped"; // Ruby raises NameError here; the graph declines
     cur = next;
   }
   return null;
 }
 
 /**
- * A method on a Ruby class named by its FULL constant path, or on one of that class's
- * own ancestors.
+ * A Ruby class's declared heritage, kept split by keyword because the three do
+ * different things and M3 merged them into one list.
+ *
+ * `prepend` inserts ABOVE the class — `Service.new.ping` reaches a prepended
+ * `Override#ping`, not `Service#ping` — so a lookup that starts at the owner and
+ * then walks its ancestors has the order exactly backwards for it. `extend`
+ * composes the SINGLETON class and never appears in `cref.ancestors` at all: it
+ * supplies class methods, not instance methods.
+ */
+interface RubyHeritage {
+  prepends: string[];
+  includes: string[];
+  supers: string[];
+  extends: string[];
+}
+
+const EMPTY_HERITAGE: RubyHeritage = { prepends: [], includes: [], supers: [], extends: [] };
+
+/** The names a Rails app's models ultimately descend from. `ActiveRecord::Base`
+ * lives in a gem and never has a node here, so the chain is recognized by the
+ * unresolved NAME at its end. */
+const AR_BASE_NAMES: ReadonlySet<string> = new Set(["ApplicationRecord", "ActiveRecord::Base", "::ActiveRecord::Base"]);
+
+/**
+ * `ActiveSupport::CurrentAttributes`, whose subclasses forward EVERY class-level
+ * call to their singleton instance.
+ *
+ * Not a guess: `CurrentAttributes` defines `method_missing` to `instance.public_send`,
+ * so `Current.system_admin?` reaches `def system_admin?` — verified on ActiveSupport
+ * 8.1, including for a method no `attribute` declared. It is the one place in Rails
+ * where the class object answers the instance chain, and `Current.*` is among the
+ * most-called receivers in a Rails app: 28 answers in filewerk's corpus alone.
+ */
+const AS_CURRENT_ATTRIBUTES_NAMES: ReadonlySet<string> = new Set([
+  "ActiveSupport::CurrentAttributes",
+  "::ActiveSupport::CurrentAttributes",
+]);
+
+/**
+ * Every class whose superclass chain reaches one of `baseNames`.
+ *
+ * For models, the gate on reading `User.first` as "one User": outside it, `first` is
+ * whatever the class itself defines — `SomeService.create(...)` is the commonest PORO
+ * shape in a Rails app, and M3 typed its result as a `SomeService` on the strength of
+ * the name alone.
+ *
+ * A fixpoint rather than a walk, because `class User < ApplicationRecord` is seen
+ * before `class ApplicationRecord < ActiveRecord::Base` as often as not.
+ */
+function collectRubyDescendants(
+  heritage: ReadonlyMap<string, RubyHeritage>,
+  superNames: ReadonlyMap<string, string[]>,
+  baseNames: ReadonlySet<string>,
+): ReadonlySet<string> {
+  const models = new Set<string>();
+  for (const [fqn, names] of superNames) {
+    if (names.some((n) => baseNames.has(n))) models.add(fqn);
+  }
+  // Bounded: each round must add at least one class or it stops, so the worst case
+  // is one round per class in the graph.
+  for (let round = 0; round < RUBY_ANCESTOR_CAP; round++) {
+    let grew = false;
+    for (const [fqn, h] of heritage) {
+      if (models.has(fqn)) continue;
+      if (h.supers.some((p) => models.has(p))) { models.add(fqn); grew = true; }
+    }
+    if (!grew) break;
+  }
+  return models;
+}
+
+/**
+ * `Klass.ancestors`, nearest first, INCLUDING the class itself — Ruby's own
+ * linearization, not a breadth-first approximation of it.
+ *
+ * The difference is not academic. With `Host` including `Sibling` and then `Near`,
+ * and `Near` including `Deep`, Ruby answers `[Host, Near, Deep, Sibling]` and
+ * dispatches a method both `Deep` and `Sibling` define to `Deep`. A breadth-first
+ * walk visits `Sibling` before `Deep` and answers `Sibling` — a wrong edge that
+ * looks right, because both targets exist and both are plausible.
+ *
+ * Depth-first, prepends before the class and includes after it, each expanded in
+ * place. The `seen` set keeps the FIRST occurrence exactly as Ruby does when a
+ * module appears twice in a hierarchy.
+ *
+ * `truncated` says the cap stopped the walk with ancestors still unexamined. A
+ * caller must treat that as "unknown", not as "absent" — see `resolveRubyConstant`.
+ */
+function rubyLinearize(
+  cref: string | undefined,
+  heritage: ReadonlyMap<string, RubyHeritage>,
+): { chain: string[]; truncated: boolean } {
+  if (!cref) return { chain: [], truncated: false };
+  const chain: string[] = [];
+  const seen = new Set<string>();
+  let truncated = false;
+  const expand = (fqn: string, depth: number): void => {
+    if (truncated || seen.has(fqn)) return;
+    if (chain.length >= RUBY_ANCESTOR_CAP || depth > RUBY_ANCESTOR_CAP) { truncated = true; return; }
+    const h = heritage.get(fqn) ?? EMPTY_HERITAGE;
+    for (const p of h.prepends) expand(p, depth + 1);
+    if (seen.has(fqn)) return; // a prepend chain that loops back onto the class itself
+    seen.add(fqn);
+    chain.push(fqn);
+    for (const m of h.includes) expand(m, depth + 1);
+    for (const sup of h.supers) expand(sup, depth + 1);
+  };
+  expand(cref, 0);
+  return { chain, truncated };
+}
+
+/** Everything a Ruby method lookup needs about the repo's class structure. Bundled
+ * because the two facts always travel together and a positional pair of maps at each
+ * of a dozen call sites is how they get passed in the wrong order. */
+interface RubyDispatch {
+  heritage: ReadonlyMap<string, RubyHeritage>;
+  /** Classes whose class-level calls fall through to their singleton INSTANCE, so a
+   * `Klass.method` there searches the instance chain too. `ActiveSupport::CurrentAttributes`
+   * subclasses, and nothing else. */
+  delegatesToInstance: ReadonlySet<string>;
+  /** Which FQNs are `module`s rather than classes. A concern's own `ClassMethods` is
+   * in its class-method chain — `class_methods do` siblings call each other, and
+   * `requiring_sync` calling `pending` is that shape — but a plain class's would be a
+   * phantom, so the step is offered only to modules. */
+  modules: ReadonlySet<string>;
+}
+
+/** One place a method lookup looks, and what kind of definition counts there. */
+interface RubyLookupStep {
+  scope: string;
+  /** `"class"` accepts `def self.x`; `"instance"` accepts `def x`. A node with no
+   * `receiver` field at all — an older graph, a `def obj.x`, a macro that really
+   * does define both — matches either. */
+  want: RubySelfKind;
+  /** Only a MACRO-declared definition counts at this step. The distinction a
+   * concern turns on: `scope :pending, -> {…}` inside an `included do` becomes a
+   * class method on every INCLUDER, while a hand-written `def self.helper` in the
+   * same module does not (`include M` never puts `M.helper` on the includer, and
+   * Ruby raises NoMethodError for it). Both are `receiver: "class"` owned by the
+   * module; only `origin` tells them apart. */
+  synthesizedOnly?: boolean;
+}
+
+/** The modules mixed into `fqn`, transitively — `prepend` and `include` only,
+ * never the superclass. The list a concern's `ClassMethods` are reached through. */
+function rubyMixinChain(fqn: string, heritage: ReadonlyMap<string, RubyHeritage>): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>([fqn]);
+  const expand = (cur: string, depth: number): void => {
+    if (depth > RUBY_ANCESTOR_CAP || out.length >= RUBY_ANCESTOR_CAP) return;
+    const h = heritage.get(cur) ?? EMPTY_HERITAGE;
+    for (const m of [...h.prepends, ...h.includes]) {
+      if (seen.has(m)) continue;
+      seen.add(m);
+      out.push(m);
+      expand(m, depth + 1);
+    }
+  };
+  expand(fqn, 0);
+  return out;
+}
+
+/**
+ * Where Ruby looks for `Klass.method` — the SINGLETON class's ancestry, which
+ * shares nothing with the instance one.
+ *
+ * Three sources, per class in the SUPERCLASS chain, in Ruby's order:
+ *   - the class's own `def self.x` (and `class << self`),
+ *   - the instance methods of every module it `extend`s,
+ *   - the `ClassMethods` module of every concern it includes, which is what
+ *     `class_methods do … end` compiles to and what a hand-written
+ *     `module ClassMethods` inside an `ActiveSupport::Concern` already is.
+ *
+ * Then the same again on the superclass: class methods ARE inherited, which is why
+ * `Child.fire` reaches `Parent.fire` even when `Child` defines an instance `fire`
+ * (verified on Ruby 3.4).
+ *
+ * Two things deliberately absent. A module's own `def self.helper` is not offered
+ * to includers — `include M` does not put `M.helper` on the includer, and Ruby
+ * raises NoMethodError for it. And an included module's INSTANCE methods are not
+ * here either: that is the other chain, and conflating the two is what made
+ * `Svc.dispatch` answer with the `include`d module when Ruby answers with the
+ * `extend`ed one.
+ */
+function rubySingletonChain(
+  cref: string,
+  dispatch: RubyDispatch,
+): { steps: RubyLookupStep[]; truncated: boolean } {
+  const heritage = dispatch.heritage;
+  const steps: RubyLookupStep[] = [];
+  const seen = new Set<string>();
+  const pushStep = (scope: string, want: RubySelfKind, synthesizedOnly = false): void => {
+    const key = `${scope}|${want}|${synthesizedOnly}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    steps.push({ scope, want, ...(synthesizedOnly ? { synthesizedOnly: true } : {}) });
+  };
+  // The superclass chain only — `include`d modules contribute class methods solely
+  // through their `ClassMethods`, handled inside the loop.
+  const klasses: string[] = [];
+  const visited = new Set<string>();
+  let cur: string | undefined = cref;
+  while (cur && !visited.has(cur) && klasses.length < RUBY_ANCESTOR_CAP) {
+    visited.add(cur);
+    klasses.push(cur);
+    cur = (heritage.get(cur) ?? EMPTY_HERITAGE).supers[0];
+  }
+  if (cur && !visited.has(cur)) return { steps, truncated: true };
+  for (const klass of klasses) {
+    if (steps.length >= RUBY_ANCESTOR_CAP) return { steps, truncated: true };
+    pushStep(klass, "class");
+    // A concern's own `ClassMethods`, so its `class_methods do` methods can call each
+    // other — which Ruby allows, because inside one `self` is the includer class and
+    // the whole module is extended into it. Modules only: on a plain class the same
+    // step would invent a `Foo::ClassMethods` nothing extends.
+    if (dispatch.modules.has(klass)) pushStep(`${klass}::ClassMethods`, "instance");
+    const h = heritage.get(klass) ?? EMPTY_HERITAGE;
+    for (const mod of h.extends) {
+      pushStep(mod, "instance");
+      for (const m of rubyMixinChain(mod, heritage)) pushStep(m, "instance");
+    }
+    for (const mixin of rubyMixinChain(klass, heritage)) {
+      pushStep(`${mixin}::ClassMethods`, "instance");
+      // …and the macros the concern declared in its `included do`, which run in the
+      // includer and so define ITS class methods. Restricted to synthesized nodes so
+      // the module's own `def self.x` stays where Ruby leaves it: out of reach.
+      pushStep(mixin, "class", true);
+    }
+    // `ActiveSupport::CurrentAttributes` forwards anything its singleton class does
+    // not answer to `instance`, so the instance chain is genuinely reachable from
+    // `Current.` — the one Rails construct where the two chains meet. Appended
+    // LAST, after everything a real class method could answer, because that is the
+    // order `method_missing` runs in.
+    if (dispatch.delegatesToInstance.has(klass)) {
+      for (const m of rubyLinearize(klass, heritage).chain) pushStep(m, "instance");
+    }
+  }
+  return { steps, truncated: false };
+}
+
+/** Does this definition answer a call made on `want`? An absent `receiver` is
+ * "unknown", never "instance": graphs built before the field exists carry none,
+ * and so does a macro that genuinely defines both halves. */
+function rubyNodeAnswers(n: NodeV1, want: RubySelfKind): boolean {
+  return n.receiver === undefined || n.receiver === want;
+}
+
+/**
+ * A method on a Ruby class named by its FULL constant path, looked up the way Ruby
+ * dispatches it — on the instance ancestry or the singleton one, never both.
  *
  * The generic `resolveTypedMember` keys on a bare class name, which is right for
  * languages where that is all a receiver expression yields. It is not right for a
  * Rails macro: `before_save :stamp` inside `A::User` states its receiver exactly, and
  * bare-name keying let that bind to a `stamp` defined on an unrelated `B::User`.
+ *
+ * `want` is what the CALLER holds, and it decides the chain:
+ *   - `instance` — prepends, the class, its includes, its superclass. Instance
+ *     methods only.
+ *   - `class` — `def self.`, `extend`ed modules, concerns' `ClassMethods`, then the
+ *     superclass's singleton chain.
+ *   - `collection` — an ActiveRecord CollectionProxy. Verified against a running
+ *     ActiveRecord 8.1: `blog.posts.publish_all` reaches `Post.publish_all` and
+ *     `blog.posts.recent` reaches the scope, while `blog.posts.publish` raises
+ *     NoMethodError for the instance method. So: the singleton chain, exactly.
  *
  * Ambiguity declines. Two files defining the same method on the same fully-qualified
  * class is a real choice this cannot make.
@@ -789,13 +1162,35 @@ function resolveRubyOwnerMethod(
   name: string,
   file: string,
   index: Map<string, NodeV1[]>,
-  ancestors: Map<string, string[]>,
+  dispatch: RubyDispatch,
+  want: RubyValueKind = "instance",
 ): { id: string; confidence: EdgeV1["confidence"] } | "ambiguous" | null {
-  const walk = ancestorPrefixes(ownerFqn, ancestors);
-  if (walk.truncated) return null;
-  for (const scope of [ownerFqn, ...walk.prefixes]) {
-    const cands = index.get(`${scope}#${name}`);
-    if (!cands || cands.length === 0) continue;
+  const instanceSteps = (): RubyLookupStep[] | null => {
+    const walk = rubyLinearize(ownerFqn, dispatch.heritage);
+    return walk.truncated ? null : walk.chain.map((scope) => ({ scope, want: "instance" as const }));
+  };
+  const classSteps = (): RubyLookupStep[] | null => {
+    const walk = rubySingletonChain(ownerFqn, dispatch);
+    return walk.truncated ? null : walk.steps;
+  };
+  let steps: RubyLookupStep[] | null;
+  if (want === "instance") steps = instanceSteps();
+  else if (want === "unknown") {
+    // A bare call inside a block whose `self` nothing names. Both chains are live
+    // possibilities, so both are searched — class first, since a block in a class
+    // body is a class-level DSL more often than not. This is the one `want` that
+    // widens rather than narrowing, and it exists because the alternative is to
+    // guess which of two readings a `test "…" do` block has.
+    const a = classSteps();
+    const b = instanceSteps();
+    steps = a === null || b === null ? null : [...a, ...b];
+  } else steps = classSteps();
+  if (steps === null) return null;
+  for (const step of steps) {
+    const all = index.get(`${step.scope}#${name}`);
+    if (!all || all.length === 0) continue;
+    const cands = all.filter((c) => rubyNodeAnswers(c, step.want) && (!step.synthesizedOnly || c.origin === "synthesized"));
+    if (cands.length === 0) continue;
     const sameFile = cands.filter((c) => c.path === file);
     // `type_bound` either way (M3). Both readings came from a KNOWN receiver
     // class, and the same-file/cross-file split that separates `extracted` from
@@ -826,14 +1221,21 @@ function resolveRubyOwnerMethod(
  *      `active` up on `User` — a different class than the one the code names.
  *   3. The call itself, owner-qualified on whatever the walk arrived at.
  *
+ * A fourth thing travels alongside all three: WHAT the receiver is. A class object,
+ * an instance and an ActiveRecord collection name the same class and answer disjoint
+ * sets of methods, and each step can change which one you hold — `Blog.new` is an
+ * instance, `.posts` is a collection, `.first` is an instance again. `resolveRubyOwnerMethod`
+ * takes it as `want` and walks the matching chain.
+ *
  * `"ambiguous"` propagates out of a step: two classes could own it and picking one
  * is exactly the guess this milestone removes.
  */
 function resolveRubyTypedCall(
   e: RawEdge,
   ownerIndex: Map<string, NodeV1[]>,
-  ancestors: Map<string, string[]>,
-  returns: ReadonlyMap<string, string>,
+  dispatch: RubyDispatch,
+  returns: ReadonlyMap<string, RubyType>,
+  models: ReadonlySet<string>,
   fqnIndex: Map<string, NodeV1[]>,
   shadow: ReadonlySet<string>,
   zeitwerk: ZeitwerkMap | null,
@@ -846,48 +1248,41 @@ function resolveRubyTypedCall(
     // `"fqn"`: this lookup wants the receiver's CONSTANT PATH, not a node to point
     // an edge at, and several files opening one constant do not disagree about
     // that. See `pickRubyConstant`.
-    const hit = resolveRubyConstant(e.rubyRecvConst, e.nesting ?? [], e.file, fqnIndex, ancestors, shadow, zeitwerk, true, "fqn");
+    const hit = constNode(resolveRubyConstant(e.rubyRecvConst, e.nesting ?? [], e.file, fqnIndex, dispatch.heritage, shadow, zeitwerk, true, "fqn"));
     cur = hit ? rubyFqnOf(hit.id) : null;
   }
   if (!cur) return null; // the receiver names a gem, stdlib, or nothing in the repo
+  // Older graphs carry no kind. "instance" is what M3 assumed everywhere, so reading
+  // an absent field that way keeps them resolving exactly as they did.
+  let kind: RubyValueKind = e.rubyRecvKind ?? "instance";
+
+  if (e.rubyRecvFinder) {
+    // The receiver was typed off ActiveRecord's finder vocabulary (`Widget.first`).
+    // Ruby would reach the class's OWN class method of that name first, so try that
+    // and use whatever it declares; only when the class defines none is AR's reading
+    // available, and only if the class really is a model.
+    const own = resolveRubyOwnerMethod(cur, e.rubyRecvFinder, e.file, ownerIndex, dispatch, "class");
+    if (own === "ambiguous") return "ambiguous";
+    if (own) {
+      const declared = returns.get(own.id);
+      if (!declared) return null; // it exists, and says nothing about what it returns
+      cur = declared.fqn;
+      kind = declared.kind;
+    } else if (!models.has(cur)) {
+      return null; // not a model, and no such class method: `first` means something else
+    }
+  }
+
   for (const step of e.rubyRecvSteps ?? []) {
-    const hop = resolveRubyOwnerMethod(cur, step, e.file, ownerIndex, ancestors);
+    const hop = resolveRubyOwnerMethod(cur, step, e.file, ownerIndex, dispatch, kind);
     if (hop === "ambiguous") return "ambiguous";
     if (!hop) return null;
     const next = returns.get(hop.id);
     if (!next) return null; // the step exists but does not declare what it returns
-    cur = next;
+    cur = next.fqn;
+    kind = next.kind;
   }
-  return resolveRubyOwnerMethod(cur, e.name!, e.file, ownerIndex, ancestors);
-}
-
-/**
- * A cref's ancestors, nearest first, cycle-guarded and bounded.
- *
- * `truncated` says the cap stopped the walk with ancestors still unexamined. A
- * caller must treat that as "unknown", not as "absent" — see `resolveRubyConstant`.
- */
-function ancestorPrefixes(
-  cref: string | undefined,
-  ancestors: Map<string, string[]>,
-): { prefixes: string[]; truncated: boolean } {
-  if (!cref) return { prefixes: [], truncated: false };
-  const out: string[] = [];
-  const seen = new Set<string>([cref]);
-  // Breadth-first over a per-class list that is already in Ruby's own order, which
-  // keeps the linearization right for the shapes that occur: a class's own mixins
-  // all precede anything reached through its superclass.
-  const queue = [cref];
-  for (let i = 0; i < queue.length; i++) {
-    for (const parent of ancestors.get(queue[i]) ?? []) {
-      if (seen.has(parent)) continue;
-      if (out.length >= RUBY_ANCESTOR_CAP) return { prefixes: out, truncated: true };
-      seen.add(parent);
-      out.push(parent);
-      queue.push(parent);
-    }
-  }
-  return { prefixes: out, truncated: false };
+  return resolveRubyOwnerMethod(cur, e.name!, e.file, ownerIndex, dispatch, kind);
 }
 
 function push<T>(map: Map<string, T[]>, key: string, val: T): void {

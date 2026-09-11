@@ -63,13 +63,18 @@ const callTargets = (g: GraphV1, source: string): string[] => calls(g, source).m
 // ── source 1: a constant written at the call site ──────────────────────────────
 
 test("ruby M3: a constant receiver binds to that class's method, not to a same-named one", async () => {
+  // A constant receiver is the CLASS OBJECT, so the method it reaches is the one
+  // `def self.` declares. `Journal.post` is the same name on a different class and
+  // must not answer; neither must an INSTANCE method named `post`, which is why
+  // `Ledger` declares both and only one of them is a legal target here.
   const src = `
 class Ledger
+  def self.post; end
   def post; end
 end
 
 class Journal
-  def post; end
+  def self.post; end
 end
 
 class Runner
@@ -81,6 +86,10 @@ end
   await withGraph({ "a.rb": src }, (g) => {
     assert.deepEqual(callTargets(g, "a.rb#Runner.go"), ["a.rb#Ledger.post"]);
     assert.equal(calls(g, "a.rb#Runner.go")[0].confidence, "type_bound");
+    // `def self.post` is the node this points at, not the instance `def post` that
+    // shares its id shape.
+    const target = g.nodes.find((n) => n.id === calls(g, "a.rb#Runner.go")[0].target);
+    assert.equal(target?.receiver, "class");
   });
 });
 
@@ -88,7 +97,7 @@ test("ruby M3: a namespaced constant receiver resolves through Module.nesting", 
   const src = `
 module Billing
   class Invoice
-    def total; end
+    def self.total; end
   end
 
   class Report
@@ -99,7 +108,7 @@ module Billing
 end
 
 class Invoice
-  def total; end
+  def self.total; end
 end
 `;
   await withGraph({ "b.rb": src }, (g) => {
@@ -282,7 +291,7 @@ end
 `,
     "app/models/post.rb": `
 class Post < ApplicationRecord
-  def publish; end
+  def self.publish; end
 end
 `,
     "app/services/publisher.rb": `
@@ -296,6 +305,10 @@ end
   };
   await withGraph(files, (g) => {
     const out = callTargets(g, "app/services/publisher.rb#Publisher.run");
+    // `blog.posts` is a CollectionProxy, which forwards class methods and scopes to
+    // the model and raises NoMethodError for its instance methods — so the target
+    // here is `def self.publish`, and an instance `def publish` would resolve to
+    // nothing (see graph-ruby-dispatch.test.ts).
     assert.ok(out.includes("app/models/post.rb#Post.publish"), out.join(", "));
     // The intermediate hop is a call in its own right: `blog.posts`.
     assert.ok(out.includes("app/models/blog.rb#Blog.posts"), out.join(", "));
@@ -732,7 +745,7 @@ test("ruby M3: a plain Ruby project types constants and assignments, and no Rail
   // define — it declares no reader and types no chain.
   const src = `
 class Post
-  def publish; end
+  def self.publish; end
 end
 
 class Blog
@@ -758,7 +771,7 @@ end
 test("ruby M3: every typed call carries the type_bound confidence, and nothing else does", async () => {
   const src = `
 class Widget
-  def ping; end
+  def self.ping; end
 end
 
 class Runner
