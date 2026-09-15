@@ -16,7 +16,7 @@ import { fileReader, referenceLine, wordRe } from "../blast/evidence.js";
 import { contextDirFor } from "../context/node-file.js";
 import { withSavings, savingsFor, type Savings } from "../context/savings.js";
 import { loadGraphCached } from "./load.js";
-import { resolveSymbol, edgeWalk, type Direction, type EdgeHit } from "./traverse.js";
+import { resolveSymbol, edgeWalk, workflowEvidence, type Direction, type EdgeHit, type WorkflowEvidence } from "./traverse.js";
 import type { GraphV1, NodeV1 } from "./types.js";
 
 export interface CallersCliOptions {
@@ -40,6 +40,40 @@ export function headerOf(n: NodeV1): string {
   return `${n.name} · ${n.kind} · ${n.path}:${n.span}`;
 }
 
+/** An enqueue names a verified job receiver and its actual declaring method.
+ * Reuse that evidence: a suffix or a coincidental `perform` method proves nothing,
+ * and an inherited entrypoint belongs to the ancestor's method, not the child. */
+export function jobEntrypointHint(graph: GraphV1, node: NodeV1): string | undefined {
+  if (node.kind !== "class" || !node.path.endsWith(".rb")) return undefined;
+  const owner = node.id.slice(node.id.indexOf("#") + 1).replace(/~\d+$/, "").split(".").join("::");
+  const sameOwner = graph.nodes.filter(n => n.kind === "class" && n.id.slice(n.id.indexOf("#") + 1).replace(/~\d+$/, "").split(".").join("::") === owner);
+  if (sameOwner.length !== 1) return undefined;
+  const targets = new Set(graph.edges.filter(edge =>
+    (edge.relation === "enqueues" || edge.relation === "dispatches") && edge.confidence === "convention" &&
+    edge.via?.startsWith("ActiveJob.") && edge.via.includes(`: ${owner}#perform `)).map(edge => edge.target));
+  if (!targets.size) return undefined;
+  const locators = [...targets].sort().map(id => graph.nodes.find(n => n.id === id && n.kind === "method" && n.name === "perform"))
+    .filter((target): target is NodeV1 => target !== undefined);
+  if (!locators.length) return undefined;
+  // Full node IDs fall back to bare `perform` in symbol lookup. Use its supported
+  // qualified suffix plus the declaring file, preserving shell metacharacters
+  // literally so the displayed command follows the same verified target.
+  const quoteArg = (arg: string): string => "'" + arg.replace(/'/g, "'\\''") + "'";
+  const entries = locators.map(target => {
+    const query = target.id.slice(target.id.indexOf("#") + 1);
+    const matches = resolveSymbol(graph, query, { in: target.path });
+    if (matches.length === 1 && matches[0].id === target.id) {
+      return `graft callers ${quoteArg(query)} --in ${quoteArg(target.path)}`;
+    }
+    // Ordinal normalization and nested namespace suffixes can prevent exact
+    // selection even within one file. Keep the verified source visible without
+    // presenting a command that selects a different or ambiguous set of nodes.
+    const reason = matches.length > 1 ? `ambiguous callers selection (${matches.length} matches)` : "exact callers selection unsupported";
+    return `${target.id} · ${target.path}:${target.span} [${reason}]`;
+  });
+  return `  ActiveJob entrypoint${locators.length > 1 ? "s (ambiguous)" : ""}: ${entries.join("; ")} — inspect perform and its enqueuers`;
+}
+
 /** `showDepth` is set for multi-hop walks (depth > 1), matching the old
  * `graft impact` output which tagged every hit with its BFS depth.
  *
@@ -51,7 +85,10 @@ export function hitLine(direction: Direction, hit: EdgeHit, showDepth: boolean, 
   const arrow = ARROW[direction];
   const depthTag = showDepth ? ` [depth ${hit.depth}]` : "";
   const label = hit.node ? `${hit.node.name} (${hit.node.path}:${hit.node.span})` : `${hit.id} (unresolved import)`;
-  const line = `  ${hit.relation} ${arrow} ${label}${depthTag}`;
+  const workflowProof = hit.relation === "enqueues" || hit.relation === "dispatches"
+    ? [hit.confidence, hit.via].filter(Boolean).join("; ") : "";
+  const proof = workflowProof ? ` [${workflowProof}]` : "";
+  const line = `  ${hit.relation} ${arrow} ${label}${depthTag}${proof}`;
   return quote ? `${line}\n      ${quote.n}: ${quote.text.trim()}` : line;
 }
 
@@ -122,9 +159,10 @@ interface MatchJson {
   symbol: SymbolJson;
   hits: HitJson[];
   note?: string;
+  hint?: string;
 }
 
-interface HitJson {
+interface HitJson extends WorkflowEvidence {
   id: string;
   name?: string;
   kind?: string;
@@ -139,7 +177,7 @@ function symbolJson(n: NodeV1): SymbolJson {
 }
 
 function hitJson(hit: EdgeHit): HitJson {
-  const out: HitJson = { id: hit.id, relation: hit.relation, depth: hit.depth };
+  const out: HitJson = { id: hit.id, relation: hit.relation, depth: hit.depth, ...workflowEvidence(hit) };
   if (hit.node) {
     out.name = hit.node.name;
     out.kind = hit.node.kind;
@@ -217,6 +255,8 @@ export function runCallersCommand(query: string, dir: string, opts: CallersCliOp
       query,
       matches: results.map((r): MatchJson => {
         const m: MatchJson = { symbol: symbolJson(r.symbol), hits: r.hits.map(hitJson) };
+        const hint = jobEntrypointHint(graph, r.symbol);
+        if (hint) m.hint = hint;
         if (r.hits.length === 0) {
           m.note = looseNoteFor(direction, r.symbol.name, matches.length);
         }
@@ -233,6 +273,8 @@ export function runCallersCommand(query: string, dir: string, opts: CallersCliOp
   const read = fileReader(root);
   for (const { symbol, hits } of results) {
     lines.push(headerOf(symbol));
+    const hint = jobEntrypointHint(graph, symbol);
+    if (hint) lines.push(hint);
     if (hits.length === 0) lines.push(looseNoteFor(direction, symbol.name, matches.length));
     else for (const h of hits) lines.push(hitLine(direction, h, showDepth, quoteFor(h, symbol.name, read)));
     lines.push("");

@@ -23,7 +23,10 @@ import { contextDirFor } from "../context/node-file.js";
 import { extractFile, languageOf } from "./extract.js";
 import { extractGeneric, genericLangOf, warmGenericGrammars } from "./generic.js";
 import { containerLangOf, extractContainer, warmContainerGrammars } from "./container.js";
-import { listSourceFiles } from "./build.js";
+import { filterByOnlyDirs, listSourceFiles } from "./source-files.js";
+import { walkDir } from "../ingest/fs.js";
+import { readFollowNestedRepos, readFollowSubmodules, readIncludeDirs } from "../util/state.js";
+import { discoverZeitwerk } from "./zeitwerk.js";
 import { readGraph, wiringPath } from "./write.js";
 import { readFingerprint } from "./fingerprint.js";
 import { readSourceFile } from "../util/source.js";
@@ -86,7 +89,17 @@ export async function checkGraph(
   // file as "added".
   const fpOnlyDirs = readFingerprint(outDir)?.onlyDirs;
   const onlyDirs = fpOnlyDirs && fpOnlyDirs.length > 0 ? new Set(fpOnlyDirs) : undefined;
-  const sourceFiles = listSourceFiles(root, outDir, undefined, onlyDirs);
+  const repoFiles = filterByOnlyDirs(walkDir(root, readIncludeDirs(root), {
+    followSubmodules: readFollowSubmodules(root),
+    followNestedRepos: readFollowNestedRepos(root),
+  }), root, onlyDirs);
+  const sourceFiles = listSourceFiles(root, outDir, repoFiles);
+  // Rails macros and concern methods have different node sets/scopes from plain
+  // Ruby. Omitting build's repo-level context reported thousands of removed nodes
+  // immediately after a clean Rails build. Discovery needs the same filtered walk,
+  // including the non-source Gemfile witness, and both extraction tiers need it.
+  const zeitwerk = discoverZeitwerk(root, repoFiles);
+  const rails = zeitwerk ? { acronyms: zeitwerk.acronyms } : null;
   await warmGenericGrammars(
     new Set(sourceFiles.map((f) => genericLangOf(f)?.name).filter((n): n is string => !!n)),
   );
@@ -116,9 +129,9 @@ export async function checkGraph(
     const rel = relPosix(root, file);
     try {
       const extracted = lang
-        ? extractFile(rel, source, lang)
+        ? extractFile(rel, source, lang, { rails })
         : container
-          ? extractContainer(rel, source, container)
+          ? extractContainer(rel, source, container, { rails })
           : generic
             ? extractGeneric(rel, source, generic.name)
             : null;

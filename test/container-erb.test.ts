@@ -241,13 +241,8 @@ test("erb: spans are the template's own, end to end", async () => {
   // mechanism it pins is not a curiosity: it is the same offset every call edge
   // out of every template rides on.
   //
-  // The expected spans are BODY-only (`L3-L3` for a `def` on line 2) because that
-  // is what every Ruby method node in this graph looks like — 1,609 of filewerk's
-  // 1,749 of them start one line below their `def`. That is a known defect
-  // inherited from the Ruby extractor and it is deliberately reproduced here
-  // rather than corrected: a template whose spans disagreed with a `.rb` file's
-  // would be a second, different bug. What this test guards is that the offset
-  // the container adds is ZERO — nothing more, and nothing less.
+  // Ruby spans include the declaration and closing end. The container's offset
+  // must stay zero, so each complete definition points at its template lines.
   const lines = [
     "<h1>Report</h1>", //  1
     "<% def headline(row) %>", //  2
@@ -260,8 +255,8 @@ test("erb: spans are the template's own, end to end", async () => {
     "</div>", //  9
   ];
   const { nodes } = extractContainer("app/views/reports/show.html.erb", erb(lines), ERB);
-  assert.equal(spanOf(nodes, "headline"), "L3-L3", "the body of the def on line 2");
-  assert.equal(spanOf(nodes, "footer"), "L7-L7", "the body of the def on line 6");
+  assert.equal(spanOf(nodes, "headline"), "L2-L4", "the complete def on line 2");
+  assert.equal(spanOf(nodes, "footer"), "L6-L8", "the complete def on line 6");
   assert.equal(nodes[0].kind, "file", "the file node stays at index 0");
   assert.equal(nodes[0].span, `L1-L${lines.length + 1}`, "the file node describes the whole template");
 });

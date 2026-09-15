@@ -27,7 +27,7 @@ export interface VizEdge {
   target: string;
   relation: string;
   description?: string;
-  confidence?: "extracted" | "inferred";
+  confidence?: string;
 }
 
 export interface EvidenceLine {
@@ -65,7 +65,7 @@ export type Family = "structure" | "dependency" | "contract" | "association";
 const FAMILY: Record<string, Family> = {
   part_of: "structure", contains: "structure",
   uses: "dependency", depends_on: "dependency", calls: "dependency", imports: "dependency",
-  renders: "dependency",
+  renders: "dependency", enqueues: "dependency", dispatches: "dependency",
   produces: "dependency", configures: "dependency", validates: "dependency",
   extends: "contract", implements: "contract",
   references: "association",
@@ -96,6 +96,8 @@ export const CHIP_HINT: Record<string, string> = {
   "implements": "what contract must this honor? (interface)",
   "references": "mentioned but never called — possible dead coupling",
   "renders": "which template does this hand off to? (Rails view conventions)",
+  "enqueues": "which work may execute asynchronously?",
+  "dispatches": "which known target may runtime dispatch reach? (not exhaustive)",
 };
 
 /** Node-type → CSS custom property, per tab. */
@@ -144,7 +146,7 @@ interface CodeGraphV1 {
     id: string; name: string; kind: string; path: string; span: string;
     signature: string | null; summary: string | null; crux: { code: string; span: string } | null;
   }>;
-  edges: Array<{ source: string; target: string; relation: string; confidence: "extracted" | "inferred" }>;
+  edges: Array<{ source: string; target: string; relation: string; confidence: string }>;
 }
 
 /** Fetch graph.json and reshape it into the viewer's graph form (null if absent). */

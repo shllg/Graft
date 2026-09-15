@@ -37,6 +37,7 @@ export class FileBindings {
    * `null` means "assigned something this pass cannot type", which is a
    * disagreement like any other. */
   private rubyAssigned = new Map<string, RubyType | null>();
+  private rubyWriteCounts = new Map<string, number>();
   /** The agreed Ruby types, filled by `finalizeRuby`. Separate from `map` because a
    * Ruby binding carries a receiver KIND that no other language has. */
   private rubyTypes = new Map<string, RubyType>();
@@ -64,6 +65,7 @@ export class FileBindings {
    * typed — both are the same fact: this name holds a value we cannot name. */
   noteRubyVar(scopeKey: string, name: string, type: RubyType | null, declAt: number): void {
     const key = `${scopeKey}|${name}`;
+    this.rubyWriteCounts.set(key, (this.rubyWriteCounts.get(key) ?? 0) + 1);
     const seen = this.rubyVars.get(key);
     // The EARLIEST declaration wins: that is where Ruby's parser starts treating the
     // name as a local, and every later write only re-assigns it.
@@ -132,6 +134,14 @@ export class FileBindings {
     if (key === null) return false;
     const declAt = this.rubyVars.get(`${key}|${name}`);
     return declAt !== undefined && at >= declAt;
+  }
+
+  /** Conditional injection must use the same declaration inventory as ordinary
+   * typing. A for target, rescue binding or pattern can replace a keyword just
+   * as an assignment does; a second AST walker must not forget those writes. */
+  hasSingleRubyWrite(scopeKey: string, name: string): boolean {
+    const key = this.rubyKeyFor(scopeKey, name);
+    return key !== null && this.rubyWriteCounts.get(`${key}|${name}`) === 1;
   }
 
   /** Ruby (M3): the agreed type of `name` read at `at`, or null. A read before the
@@ -248,6 +258,36 @@ function rubyDefName(node: Parser.SyntaxNode, rails: boolean): string | null {
   return path === null ? null : path.replace(/^::/, "").split("::").join(".");
 }
 
+/** This spelling supplies a named class candidate for resolver validation. Its block keeps
+ * the caller's lexical constants, but owns methods and ivars on the new class. */
+export function rubyNamedClassFactory(node: Parser.SyntaxNode): { name: string; parent: string; call: Parser.SyntaxNode; block: Parser.SyntaxNode | null } | null {
+  if (node.type !== "assignment") return null;
+  const left = node.childForFieldName("left");
+  const call = node.childForFieldName("right");
+  if (left?.type !== "constant" || call?.type !== "call" || call.childForFieldName("method")?.text !== "new") return null;
+  const receiver = call.childForFieldName("receiver");
+  if (receiver?.type !== "constant" || receiver.text !== "Class") return null;
+  const args = call.childForFieldName("arguments")?.namedChildren ?? [];
+  if (args.length !== 1) return null;
+  const parent = rubyConstPath(args[0]);
+  return parent ? { name: left.text, parent, call, block: call.childForFieldName("block") } : null;
+}
+
+/** A constant-assigned factory block can define methods on an unnamed object.
+ * Letting its defs or ivar assignments enter the surrounding class gives callers
+ * a confident edge into an object Ruby never uses. Recognized Class.new blocks
+ * are consumed by their assignment in both walks before this barrier. Anonymous
+ * stubs and ordinary constructor blocks retain their existing inspection/call
+ * behavior; this repair only changes statically constant-assigned factories. */
+export function rubyUnknownFactoryBlock(node: Parser.SyntaxNode): boolean {
+  if (node.type !== "block" && node.type !== "do_block") return false;
+  const call = node.parent;
+  if (call?.type !== "call") return false;
+  const assignment = call.parent;
+  const left = assignment?.childForFieldName("left");
+  return assignment?.type === "assignment" && (left?.type === "constant" || left?.type === "scope_resolution");
+}
+
 /** `class_methods do ... end` — ActiveSupport::Concern's spelling of a nested
  * `module ClassMethods`. Mirrors extract.ts's `rubyClassMethodsBlock`. */
 function rubyIsClassMethodsBlock(node: Parser.SyntaxNode): boolean {
@@ -306,6 +346,28 @@ export type RubySelfKind = "instance" | "class";
  * instead of picking one, and says so in the graph rather than pretending.
  */
 export type RubySelfContext = RubySelfKind | "unknown";
+
+/** Both walks must agree when a block's ivars belong to an object other than
+ * lexical self. Otherwise an instance_eval assignment types the surrounding
+ * service's field even though Ruby wrote it on a completely different object. */
+export function rubyBlockSelfContext(node: Parser.SyntaxNode, current: RubySelfContext): RubySelfContext {
+  if (node.type !== "block" && node.type !== "do_block") return current;
+  return current === "class" || rubyBlockRebindsSelf(node)
+    ? "unknown" : current;
+}
+
+function rubyBlockRebindsSelf(node: Parser.SyntaxNode): boolean {
+  if (node.type !== "block" && node.type !== "do_block") return false;
+  const method = node.parent?.childForFieldName("method")?.text;
+  return !!method && ["instance_eval", "instance_exec", "class_eval", "class_exec", "module_eval", "module_exec"].includes(method);
+}
+
+/** Separate foreign blocks cannot share even the old unknown-self ivar slot.
+ * That slot is useful for setup/test DSLs, but two instance_eval calls may run
+ * on entirely unrelated objects. The source position isolates those bindings. */
+export function rubyBlockClassScope(node: Parser.SyntaxNode, scope: string | null): string | null {
+  return rubyBlockRebindsSelf(node) ? `${scope ?? ""}%rebound@${node.startIndex}` : scope;
+}
 
 export interface RubyType {
   fqn: string;
@@ -555,7 +617,15 @@ function rubyExprType(node: Parser.SyntaxNode, ctx: RubyTypeCtx, depth = 0): Rub
   if (receiver.type !== "constant" && receiver.type !== "scope_resolution") return null;
   const fqn = rubyConstPath(receiver);
   if (fqn === null) return null;
-  return rubyConstructorType(fqn, method.text, node.childForFieldName("arguments"), ctx);
+  return rubyConstructorType(fqn, method.text, node, ctx);
+}
+
+/** A constructor block may replace singleton methods on the yielded instance.
+ * Every constructor type source needs this check, including assignments, method
+ * returns and direct receivers; guarding only keyword injection left them typed. */
+export function rubyConstructionHasBlock(node: Parser.SyntaxNode): boolean {
+  return !!node.childForFieldName("block") || node.namedChildren.some(child => child.type === "block" || child.type === "do_block") ||
+    !!node.childForFieldName("arguments")?.namedChildren.some(child => child.type === "block_argument" || child.type === "forward_argument");
 }
 
 /** `Klass.<name>(args)` read as a constructor or finder, or null when the name is
@@ -564,9 +634,11 @@ function rubyExprType(node: Parser.SyntaxNode, ctx: RubyTypeCtx, depth = 0): Rub
 export function rubyConstructorType(
   fqn: string,
   name: string,
-  args: Parser.SyntaxNode | null,
+  call: Parser.SyntaxNode,
   ctx: RubyTypeCtx,
 ): RubyType | null {
+  if (rubyConstructionHasBlock(call)) return null;
+  const args = call.childForFieldName("arguments");
   if (RUBY_PLAIN_CONSTRUCTORS.has(name)) return { fqn, kind: "instance" };
   if (!ctx.rails) return null;
   const yieldsOne = AR_RECORD_FINDERS.get(name);
@@ -701,67 +773,113 @@ export function rubyMethodReturnType(
  * Where each name is filed, and from which position it counts as bound, is
  * `rubyScopeKey` and `RUBY_ALWAYS_BOUND`.
  */
-function handleRuby(node: Parser.SyntaxNode, ctx: RubyTypeCtx, bindings: FileBindings): void {
-  const declare = (target: Parser.SyntaxNode, type: RubyType | null, declAt: number): void => {
-    if (target.type === "destructured_parameter" || target.type === "left_assignment_list") {
-      for (const child of target.namedChildren) declare(child, null, declAt);
+export interface RubyBindingDeclaration {
+  target: Parser.SyntaxNode;
+  name: string;
+  value: Parser.SyntaxNode | null;
+  assignment: boolean;
+  parameter?: string;
+}
+
+// Ruby's _mlhs contains nested destructured_left_assignment and rest_assignment,
+// while formal/pattern captures use named parameter wrappers. Descend only these
+// target containers: a call, subscript or constant lhs contains reads, not local
+// declarations. Anonymous rest targets have no child to declare.
+const RUBY_BINDING_TARGET_CONTAINERS = new Set([
+  "left_assignment_list", "destructured_left_assignment", "rest_assignment", "destructured_parameter",
+]);
+const RUBY_NAMED_BINDING_PARAMETERS = new Set([
+  "splat_parameter", "hash_splat_parameter", "block_parameter", "keyword_parameter", "optional_parameter",
+]);
+
+/** Decode variable writes once for both file-local typing and cross-file
+ * injection invalidation. A second syntax list forgot for/rescue writers in
+ * reopened classes even after the local type table correctly saw them. */
+export function rubyBindingDeclarations(node: Parser.SyntaxNode): RubyBindingDeclaration[] {
+  const declarations: RubyBindingDeclaration[] = [];
+  const declare = (target: Parser.SyntaxNode, value: Parser.SyntaxNode | null = null, assignment = false, parameter?: string): void => {
+    if (RUBY_BINDING_TARGET_CONTAINERS.has(target.type)) {
+      for (const child of target.namedChildren) declare(child);
+      return;
+    }
+    if (RUBY_NAMED_BINDING_PARAMETERS.has(target.type)) {
+      const name = target.childForFieldName("name");
+      if (name) declare(name);
       return;
     }
     const kind = target.type;
     if (kind !== "identifier" && kind !== "instance_variable" && kind !== "class_variable" && kind !== "global_variable") {
       return;
     }
-    const key = rubyScopeKey(target.text, ctx.scope, ctx.classScope, ctx.selfKind);
-    // Only a LOCAL becomes a variable at a position; see RUBY_ALWAYS_BOUND.
-    const at = kind === "identifier" ? declAt : RUBY_ALWAYS_BOUND;
-    // A global can be written from any file in the program, so it is recorded as a
-    // name but never as a type.
-    bindings.noteRubyVar(key, target.text, kind === "global_variable" ? null : type, at);
+    declarations.push({ target, name: target.text, value, assignment, ...(parameter ? { parameter } : {}) });
   };
 
   if (node.type === "assignment" || node.type === "operator_assignment") {
     const left = node.childForFieldName("left");
     const right = node.childForFieldName("right");
-    if (!left) return;
+    if (!left) return declarations;
     // A destructuring assignment hands no target an expression of its own, so
     // every name in it is recorded as untypeable rather than given the whole
     // right-hand side's type.
     if (left.type === "left_assignment_list") {
-      declare(left, null, node.startIndex);
-      return;
+      declare(left);
+      return declarations;
     }
-    declare(left, right ? rubyExprType(right, ctx) : null, node.startIndex);
-    return;
+    declare(left, right, true);
+    return declarations;
   }
   if (node.type === "method_parameters" || node.type === "block_parameters" || node.type === "lambda_parameters") {
     for (const p of node.namedChildren) {
-      declare(p.type === "identifier" || p.type === "destructured_parameter" ? p : (p.childForFieldName("name") ?? p), null, node.startIndex);
+      const target = p.type === "identifier" || p.type === "destructured_parameter" ? p : (p.childForFieldName("name") ?? p);
+      declare(target, p.childForFieldName("value"), false,
+        node.type === "method_parameters" && p.type === "keyword_parameter" ? target.text : undefined);
     }
-    return;
+    return declarations;
   }
   // `rescue Foo => e` — `e` is a local for the rest of the clause, and it is the
   // single most common untypeable receiver in a Rails app (`e.message`).
   if (node.type === "exception_variable") {
     const first = node.namedChildren[0];
-    if (first) declare(first, null, node.startIndex);
-    return;
+    if (first) declare(first);
+    return declarations;
   }
   // `for x in list` — the only Ruby loop that introduces a name without an
   // assignment or a parameter list.
   if (node.type === "for") {
     const first = node.namedChildren[0];
-    if (first) declare(first, null, node.startIndex);
-    return;
+    if (first) declare(first);
+    return declarations;
   }
   // Ruby 3 pattern matching binds names too: `in {user: User => u}` makes `u` a
   // local, and `u.name` would otherwise read as a call on the enclosing class
   // through the receiver position extract.ts now accepts. Every identifier
   // directly under a pattern node is a binding — over-approximating here costs at
   // most a missed edge, while under-approximating costs a wrong one.
+  if (["match_pattern", "test_pattern", "in_clause"].includes(node.type)) {
+    const pattern = node.childForFieldName("pattern");
+    if (pattern?.type === "identifier") declare(pattern);
+  }
   if (RUBY_PATTERN_NODES.has(node.type)) {
-    for (const child of node.namedChildren) if (child.type === "identifier") declare(child, null, node.startIndex);
+    for (const child of node.namedChildren) if (child.type === "identifier" || RUBY_NAMED_BINDING_PARAMETERS.has(child.type)) declare(child);
     const named = node.childForFieldName("name");
-    if (named?.type === "identifier") declare(named, null, node.startIndex);
+    if (named?.type === "identifier") declare(named);
+    // `{dispatcher:}` binds a local despite having only a hash_key_symbol in
+    // the tree. It must invalidate an earlier keyword just like `=> dispatcher`.
+    const key = node.childForFieldName("key");
+    if (node.type === "keyword_pattern" && key?.type === "hash_key_symbol" && node.namedChildren.length === 1) {
+      declarations.push({ target: key, name: key.text, value: null, assignment: false });
+    }
+  }
+  return declarations;
+}
+
+function handleRuby(node: Parser.SyntaxNode, ctx: RubyTypeCtx, bindings: FileBindings): void {
+  for (const declaration of rubyBindingDeclarations(node)) {
+    const { name, target, value, assignment } = declaration;
+    const key = rubyScopeKey(name, ctx.scope, ctx.classScope, ctx.selfKind);
+    const at = name.startsWith("@") || name.startsWith("$") ? RUBY_ALWAYS_BOUND : node.startIndex;
+    const type = assignment && value && target.type !== "global_variable" ? rubyExprType(value, ctx) : null;
+    bindings.noteRubyVar(key, name, type, at);
   }
 }
 
@@ -1050,7 +1168,20 @@ function visit(
   selfKind: RubySelfContext,
   inSingletonClass: boolean,
   rails: boolean,
+  rubyLexicalScope: string[] = [],
 ): void {
+  if (lang === "ruby") {
+    if (node.type === "class" || node.type === "module") scope = rubyLexicalScope;
+    const factory = rubyNamedClassFactory(node);
+    if (factory) {
+      const ownScope = [...rubyLexicalScope, factory.name];
+      for (const child of factory.block?.namedChildren ?? []) {
+        visit(child, lang, ownScope, ownScope.join("."), bindings, aliases, "class", false, rails, rubyLexicalScope);
+      }
+      return;
+    }
+    if (rubyUnknownFactoryBlock(node)) return;
+  }
   if (lang === "python") handlePy(node, scope, classScope, bindings, aliases);
   else if (lang === "go") handleGo(node, scope, bindings);
   else if (lang === "cpp") handleCpp(node, scope, classScope, bindings, aliases);
@@ -1090,13 +1221,17 @@ function visit(
     // includer class. `inSingletonClass` carries that to the `def`s inside it,
     // exactly as `class << self` does.
     else if (node.type === "call" && rubyIsClassMethodsBlock(node)) { childSelf = "class"; childInSingleton = true; }
-    else if (selfKind === "class" && (node.type === "do_block" || node.type === "block")) childSelf = "unknown";
+    else {
+      childSelf = rubyBlockSelfContext(node, selfKind);
+      childClassScope = rubyBlockClassScope(node, childClassScope);
+    }
   }
   if (lang === "ruby" && (node.type === "method" || node.type === "singleton_method") && name !== null) {
     bindings.noteRubyMethodScope(childScope.join("."));
   }
   for (const child of node.namedChildren) {
-    visit(child, lang, childScope, childClassScope, bindings, aliases, childSelf, childInSingleton, rails);
+    visit(child, lang, childScope, childClassScope, bindings, aliases, childSelf, childInSingleton, rails,
+      lang === "ruby" && (node.type === "class" || node.type === "module") ? childScope : rubyLexicalScope);
   }
 }
 

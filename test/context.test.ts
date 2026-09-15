@@ -423,6 +423,34 @@ test("graft check: keyless build then code changes (wiring stale) exits 1", () =
   }
 });
 
+test("graft check preserves Rails extraction context after a fresh build", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ctxgraph-rails-check-"));
+  const graph = mkdtempSync(join(tmpdir(), "ctxgraph-rails-output-"));
+  try {
+    mkdirSync(join(dir, "config"));
+    mkdirSync(join(dir, "app/models"), { recursive: true });
+    writeFileSync(join(dir, "Gemfile"), 'gem "rails"\n');
+    writeFileSync(join(dir, "config/application.rb"), "class Application < Rails::Application\nend\n");
+    writeFileSync(join(dir, "app/models/post.rb"), "class Post < ApplicationRecord\n  belongs_to :user\nend\n");
+    writeFileSync(join(dir, "app/models/searchable.rb"), "module Searchable\n  extend ActiveSupport::Concern\n  class_methods do\n    def search; end\n  end\nend\n");
+    const built = runCli(["--dir", graph, "build", dir]);
+    assert.equal(built.status, 0, built.stderr);
+    const checked = runCli(["--dir", graph, "check", dir, "--json"]);
+    assert.equal(checked.status, 0, checked.stdout + checked.stderr);
+    assert.equal(JSON.parse(checked.stdout).graph.ok, true);
+
+    // A restricted build intentionally omits the Gemfile witness. Check must
+    // discover Rails from exactly that same file set, not the entire repo.
+    const limited = runCli(["--dir", graph, "build", dir, "--only-dir", "app"]);
+    assert.equal(limited.status, 0, limited.stderr);
+    const checkedLimited = runCli(["--dir", graph, "check", dir, "--json"]);
+    assert.equal(checkedLimited.status, 0, checkedLimited.stdout + checkedLimited.stderr);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(graph, { recursive: true, force: true });
+  }
+});
+
 // ensureGitignored — every `graft build` self-ignores its regenerable graph dir.
 test("ensureGitignored: creates .gitignore with the graft/ entry when none exists", () => {
   const dir = mkdtempSync(join(tmpdir(), "ctxgi-"));

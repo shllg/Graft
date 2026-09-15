@@ -62,6 +62,8 @@ export type Confidence =
   | "lsp_dispatch"
   | "extracted"
   | "type_bound"
+  | "ruby_dispatch" // a known possible runtime receiver, never an exhaustive call set
+  | "ruby_injection" // conditional keyword/default binding with source evidence
   | "convention"
   | "inferred";
 
@@ -149,13 +151,17 @@ export type Relation =
   // call-resolution rate this project measures itself by. And M4's acceptance asks
   // for the precision of these edges SPECIFICALLY — the lesson of T7b is that a
   // claim mixed into a larger number is a claim the harness cannot check.
-  | "renders";
+  | "renders"
+  | "enqueues" // schedules asynchronous execution
+  | "dispatches"; // conditional runtime/framework target, with evidence in via
 
 export interface EdgeV1 {
   source: string; // node id
   target: string; // node id, or an unresolved module string for imports
   relation: Relation;
   confidence: Confidence;
+  /** The declaration or receiver condition that justified this edge. */
+  via?: string;
 }
 
 /** A ranking scope: a sub-project discovered by project-marker files (`package.json`,

@@ -172,7 +172,7 @@ export async function buildGraph(
   // extraction, to know that `has_many :items` is a declaration rather than a call,
   // and resolution, to use the autoload map as a tiebreak. Discovered once.
   const zeitwerk = discoverZeitwerk(root, repoFiles);
-  const rails = zeitwerk ? { acronyms: zeitwerk.acronyms } : null;
+  const rails = zeitwerk ? { acronyms: zeitwerk.acronyms, goodJobVersion: readGoodJobVersion(root) } : null;
   // What the memo must turn over on when it changes — see ExtractCache.inputs.
   const extractInputs = extractInputsKey(rails);
 
@@ -302,6 +302,7 @@ export async function buildGraph(
   const edges = resolveEdges(nodes, rawEdges, {
     goModules: readGoModules(root, repoFiles),
     zeitwerk,
+    goodJobVersion: rails?.goodJobVersion,
     railsIncludeAllHelpers: zeitwerk ? readIncludeAllHelpers(root, repoFiles) : undefined,
   });
 
@@ -422,4 +423,20 @@ export async function buildGraph(
     meaning,
     errors,
   };
+}
+
+/** A PATH/GIT gem can reuse a public version while changing its methods. Only the
+ * standard RubyGems lock section certifies the small forwarding convention in
+ * resolve.ts; a missing or conflicting lock leaves external mixins unknown. */
+function readGoodJobVersion(root: string): string | undefined {
+  for (const name of ["Gemfile.lock", "gems.locked"]) {
+    let lock: string;
+    try { lock = readFileSync(resolve(root, name), "utf8"); } catch { continue; }
+    const declarations = [...lock.matchAll(/^    good_job \(([^)]+)\)$/gm)];
+    if (declarations.length !== 1 || declarations[0][1] !== "4.19.2") return undefined;
+    const gem = /^GEM\n  remote: https:\/\/rubygems\.org\/?\n  specs:\n(?:(?:[ \t].*|)\n)*/m.exec(lock)?.[0];
+    if (!gem || !/^    good_job \(4\.19\.2\)$/m.test(gem)) return undefined;
+    return "4.19.2";
+  }
+  return undefined;
 }

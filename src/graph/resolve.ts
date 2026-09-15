@@ -15,7 +15,7 @@
 import { posix } from "node:path";
 import { toPosixPath } from "../util/paths.js";
 import type { EdgeV1, Kind, NodeV1, Relation } from "./types.js";
-import { languageOf, type RawEdge } from "./extract.js";
+import { languageOf, type RawEdge, type RubyBindingValue } from "./extract.js";
 import type { RubySelfKind, RubyType, RubyValueKind } from "./bindings.js";
 import { genericLangOf } from "./generic.js";
 import { containerLangOf } from "./container.js";
@@ -132,6 +132,9 @@ export interface ResolveOptions {
    * Absent means Rails' default, true. Checked rather than assumed: assuming it
    * would put edges into helpers a template provably cannot reach. */
   railsIncludeAllHelpers?: boolean;
+  /** Pinned public GoodJob package version; only verified forwarding conventions
+   * may use this to cross an otherwise unknown external mixin. */
+  goodJobVersion?: string;
 }
 
 export function resolveEdges(
@@ -234,10 +237,15 @@ export function resolveEdges(
   // lookup finds but the graph cannot point at — `MAX = 10` has no node — so they
   // exist only to make the search stop where Ruby stops. See `RawEdge.rubyConstDecl`.
   const rubyShadow = new Set<string>();
+  // Alias validation must use these same resolved assignment identities. A
+  // qualified write can target an outer namespace despite its lexical nesting.
+  const rubyConstAssignments = new Map<string, RawEdge[]>();
   for (const e of rawEdges) {
-    if (!e.rubyConstDecl || !e.name) continue;
+    if (!e.rubyConstDecl || !e.name || e.name.includes("::")) continue;
     const cref = e.nesting?.[0];
-    rubyShadow.add(cref ? `${cref}::${e.name}` : e.name);
+    const path = cref ? `${cref}::${e.name}` : e.name;
+    rubyShadow.add(path);
+    push(rubyConstAssignments, path, e);
   }
 
   // Ruby ancestors, FQN-keyed, for step 2 of the constant lookup. Built from the
@@ -259,15 +267,56 @@ export function resolveEdges(
   // ActiveRecord is a gem and has no node here — and that unresolvable name is
   // exactly the evidence that the chain reaches a model. See `rubyModels`.
   const rubySuperNames = new Map<string, string[]>();
+  const rubyExternalSupers = new Map<string, string[]>();
+  const rubyUnknownMixins = new Set<string>();
+  const rubyUnknownMixinNames = new Map<string, { name: string; kind: RawEdge["rubyHeritage"]; external: boolean }[]>();
+  const supportedFrameworkMixins = new Set(["ActiveSupport::Concern", "GoodJob::ActiveJobExtensions::Concurrency", "GoodJob::ActiveJobExtensions::Labels"]);
+  const composedNamespaces = new Set(rawEdges.filter(e => e.rubyHeritage).map(e => e.rubyOwnerFqn ?? rubyFqnOf(e.source)));
   const heritageByOwner = new Map<string, { kind: RawEdge["rubyHeritage"]; fqn: string; id: string }[]>();
   for (const e of rawEdges) {
+    if (e.rubyHeritageUnknown) {
+      const owner = e.rubyOwnerFqn ?? rubyFqnOf(e.source);
+      if (owner) {
+        rubyUnknownMixins.add(owner);
+        push(rubyUnknownMixinNames, owner, { name: "<computed mixin>", kind: e.rubyHeritage, external: false });
+      }
+      continue;
+    }
     if (e.relation !== "extends" || !e.name || !e.nesting) continue;
     const ownFqn = rubyFqnOf(e.source);
     if (!ownFqn) continue;
     if (e.rubyHeritage === "superclass" || e.rubyHeritage === undefined) push(rubySuperNames, ownFqn, e.name);
     const hit = resolveRubyConstant(e.name, e.nesting, e.file, rubyFqn, NO_HERITAGE, rubyShadow, zeitwerk, false);
+    if (hit === null && e.rubyHeritage === "superclass") push(rubyExternalSupers, ownFqn, e.name);
     const parentFqn = hit && hit !== "stopped" ? rubyFqnOf(hit.id) : null;
-    if (!hit || hit === "stopped" || !parentFqn) continue;
+    if (!hit || hit === "stopped" || !parentFqn) {
+      if (e.rubyHeritage && e.rubyHeritage !== "superclass") {
+        rubyUnknownMixins.add(ownFqn);
+        const name = e.name.replace(/^::/, "");
+        let external = hit === null;
+        // Rails tests commonly reopen ActiveSupport to extend TestCase. Once its
+        // namespace has a node, the absent gem member Concern returns "stopped"
+        // rather than null. That is not a local replacement. For the framework
+        // modules already supported below, verify the canonical module namespace
+        // and an absent terminal; lexical shadows and composed namespaces decline.
+        if (hit === "stopped" && supportedFrameworkMixins.has(name) && !rubyFqn.has(name)) {
+          const namespace = e.name.slice(0, e.name.lastIndexOf("::"));
+          const expected = name.slice(0, name.lastIndexOf("::"));
+          const parent = resolveRubyConstant(namespace, e.nesting, e.file, rubyFqn, NO_HERITAGE, rubyShadow, zeitwerk, false, "fqn");
+          external = !!parent && parent !== "stopped" && rubyFqnOf(parent.id) === expected &&
+            byId.get(parent.id)?.kind === "module" && !composedNamespaces.has(expected) &&
+            !(rubyOwnerMethod.get(`${expected}#const_missing`) ?? []).some(n => rubyNodeAnswers(n, "class"));
+        }
+        push(rubyUnknownMixinNames, ownFqn, { name, kind: e.rubyHeritage, external });
+      }
+      continue;
+    }
+    if (supportedFrameworkMixins.has(e.name.replace(/^::/, "")) && e.rubyHeritage !== "superclass") {
+      // An in-repo replacement may implement arbitrary inclusion/extension hooks.
+      // Its name cannot borrow the external framework package's target contract.
+      rubyUnknownMixins.add(ownFqn);
+      push(rubyUnknownMixinNames, ownFqn, { name: parentFqn, kind: e.rubyHeritage, external: false });
+    }
     push(heritageByOwner, ownFqn, { kind: e.rubyHeritage, fqn: parentFqn, id: e.source });
     // The inverse edge, for M2: which classes include this concern. A declaration
     // inside an `included do` block runs in each of them, so this is the list its
@@ -282,6 +331,10 @@ export function resolveEdges(
     // are read as `include`s — the commonest of the three and the only one that
     // affects neither the head nor the tail of the linearization.
     const untagged = entries.filter((x) => x.kind === undefined).map((x) => x.fqn);
+    if (new Set(kindOf("superclass")).size > 1) {
+      rubyUnknownMixins.add(ownFqn);
+      push(rubyUnknownMixinNames, ownFqn, { name: "<conflicting superclasses>", kind: "superclass", external: false });
+    }
     rubyHeritage.set(ownFqn, {
       prepends: kindOf("prepend").reverse(),
       includes: [...kindOf("include").reverse(), ...untagged],
@@ -289,10 +342,157 @@ export function resolveEdges(
       extends: kindOf("extend").reverse(),
     });
   }
+  const rubyWorkflowUncertainShadows = new Set<string>();
+  // Qualified assignments resolve their namespace, rather than appending a
+  // literal `A::B` to the lexical nesting. They were previously discarded, so an
+  // overwritten namespaced mailbox/job retained its original executable target.
+  for (const e of rawEdges) {
+    if (!e.rubyConstDecl || !e.name?.includes("::")) continue;
+    const cut = e.name.lastIndexOf("::");
+    const namespace = e.name.slice(0, cut);
+    const terminal = e.name.slice(cut + 2);
+    if (!namespace) { rubyShadow.add(terminal); push(rubyConstAssignments, terminal, e); continue; } // ::Name = ...
+    const hit = resolveRubyConstant(namespace, e.nesting ?? [], e.file, rubyFqn, rubyHeritage, rubyShadow, zeitwerk, true, "fqn");
+    const owner = hit && hit !== "stopped" ? rubyFqnOf(hit.id) : null;
+    if (owner) {
+      const path = `${owner}::${terminal}`;
+      rubyShadow.add(path);
+      push(rubyConstAssignments, path, e);
+    } else {
+      // An implicit Zeitwerk or gem namespace may have no indexed node. That
+      // does not erase the assignment. Keep each possible lexical identity as a
+      // workflow-only barrier; none of these possibilities resolves a new edge.
+      const absolute = e.name.startsWith("::");
+      const path = e.name.replace(/^::/, "");
+      const ancestors = absolute ? [] : rubyLinearize(e.nesting?.[0], rubyHeritage).chain;
+      const prefixes = absolute ? [""] : [...(e.nesting ?? []), ...ancestors, ""];
+      for (const prefix of prefixes) rubyWorkflowUncertainShadows.add(prefix ? `${prefix}::${path}` : path);
+    }
+  }
+
+  // A Class.new assignment is only a syntactic declaration until the complete
+  // repository can prove that Class still names the builtin and the target has
+  // one identity. Keep source nodes for inspection, as with reassigned ordinary
+  // classes, but remove invalid candidates from EVERY resolution index. Filtering
+  // just their incoming calls would leave their methods available to self dispatch,
+  // inherited lookup and the unique-name fallback.
+  const factories = rawEdges.filter(edge => edge.rubyClassFactory);
+  if (factories.length) {
+    const barriers = new Set([...rubyShadow, ...rubyWorkflowUncertainShadows]);
+    const shadowed = (fqn: string): boolean => fqn.split("::").some((_, i, parts) => barriers.has(parts.slice(0, i + 1).join("::")));
+    const invalid = new Set<string>();
+    const mutations = rawEdges.filter(edge => edge.rubyClassMutation);
+    const builtinAncestors = ["Class", "Module", "Object", "BasicObject"];
+    const aliasBindings = new Map<string, (RubyBindingValue | null)[]>();
+    const aliasConstants = new Map<string, (RubyBindingValue | null)[]>();
+    for (const edge of rawEdges) {
+      if (edge.rubyClassAliasBinding) push(aliasBindings, edge.rubyClassAliasBinding.key, edge.rubyClassAliasBinding.value);
+    }
+    for (const [path, assignments] of rubyConstAssignments) {
+      for (const edge of assignments) push(aliasConstants, path, edge.rubyConstAlias ?? null);
+    }
+    // These aliases are barriers, never dispatch evidence. Keep every writer:
+    // even a conflicting assignment may have exposed Class to a later mutation.
+    // Visit each indexed alias once, so cycles terminate without a depth guess.
+    // Missing bindings and unrelated external namespaces supply no evidence that
+    // Class was modified; treating them as such disabled every real factory.
+    const mutationAliases = (value: RubyBindingValue | null): string[] => {
+      const pending = [value];
+      const seen = new Set<string>();
+      const targets = new Set<string>();
+      while (pending.length) {
+        const value = pending.pop();
+        if (!value) continue;
+        let key: string;
+        let writers: (RubyBindingValue | null)[] | undefined;
+        if ("binding" in value) {
+          key = `binding:${value.binding}`;
+          writers = aliasBindings.get(value.binding);
+        } else {
+          const prefixes = value.constant.startsWith("::") ? [""]
+            : [...value.nesting, ...rubyLinearize(value.nesting[0], rubyHeritage).chain, ""];
+          const path = value.constant.replace(/^::/, "");
+          const match = prefixes.map(prefix => prefix ? `${prefix}::${path}` : path)
+            .find(candidate => aliasConstants.has(candidate) || rubyFqn.has(candidate));
+          key = `constant:${match ?? path}`;
+          writers = match ? aliasConstants.get(match) : undefined;
+          if (!writers) {
+            const target = resolveRubyConstant(value.constant, value.nesting, value.file, rubyFqn,
+              rubyHeritage, rubyShadow, zeitwerk, true, "fqn");
+            if (target !== "stopped") targets.add(target ? rubyFqnOf(target.id)! : path);
+            continue;
+          }
+        }
+        if (seen.has(key) || !writers) continue;
+        seen.add(key);
+        pending.push(...writers);
+      }
+      return [...targets];
+    };
+    const mutationTargets = mutations.flatMap(edge => mutationAliases(edge.rubyClassMutationBinding
+      ? { binding: edge.rubyClassMutationBinding }
+      : edge.name ? { constant: edge.name, file: edge.file, nesting: edge.nesting ?? [] } : null));
+    const builtinChanged = builtinAncestors.some(owner => (rubyOwnerMethod.get(`${owner}#new`) ?? [])
+      .some(node => owner === "Class" || rubyNodeAnswers(node, "class"))) ||
+      mutationTargets.some(target => builtinAncestors.includes(target));
+    const mutatedOwners = new Set(mutationTargets);
+    const factoryDispatch: RubyDispatch = { heritage: rubyHeritage, delegatesToInstance: new Set(),
+      modules: new Set([...rubyFqn].filter(([, candidates]) => candidates.some(node => node.kind === "module")).map(([fqn]) => fqn)) };
+    for (const edge of factories) {
+      const owner = rubyFqnOf(edge.source)!;
+      const factory = resolveRubyConstant("Class", edge.nesting ?? [], edge.file,
+        rubyFqn, rubyHeritage, rubyShadow, zeitwerk, true, "fqn");
+      const parent = edge.name ? resolveRubyConstant(edge.name, edge.nesting ?? [], edge.file,
+        rubyFqn, rubyHeritage, rubyShadow, zeitwerk, true, "fqn") : "stopped";
+      const constructor = rubySingletonChain(owner, factoryDispatch);
+      const constructorChanged = constructor.truncated || constructor.steps.some(step =>
+        mutatedOwners.has(step.scope) || ["new", "inherited"].some(name =>
+          (rubyOwnerMethod.get(`${step.scope}#${name}`) ?? []).some(node => rubyNodeAnswers(node, step.want))));
+      if (factory !== null || builtinChanged || constructorChanged || shadowed(owner) || (rubyFqn.get(owner)?.length ?? 0) !== 1 ||
+          parent === "stopped" || (parent && (byId.get(parent.id)?.kind !== "class" || shadowed(rubyFqnOf(parent.id)!)))) invalid.add(owner);
+    }
+    const dependentDefinitions = rawEdges.filter(edge => edge.rubyTypeOnly && edge.relation === "contains" && edge.targetId && edge.rubyFactoryDependencies?.length);
+    const dependsOnInvalid = (edge: RawEdge): boolean => !!edge.rubyFactoryDependencies?.some(id => invalid.has(rubyFqnOf(id)!));
+    // A factory can inherit another factory or be nested under one. Withdraw the
+    // dependent identity too; otherwise removing the first ancestry edge revives
+    // its child's own methods through an apparently ordinary constant.
+    for (let round = 0; round < factories.length; round++) {
+      let grew = false;
+      const unavailable = new Set([...invalid, ...dependentDefinitions.filter(dependsOnInvalid).map(edge => rubyFqnOf(edge.targetId!)!)]);
+      for (const edge of factories) {
+        const owner = rubyFqnOf(edge.source)!;
+        if (invalid.has(owner)) continue;
+        const parent = edge.name ? constNode(resolveRubyConstant(edge.name, edge.nesting ?? [], edge.file,
+          rubyFqn, rubyHeritage, rubyShadow, zeitwerk, true, "fqn")) : null;
+        const parentFqn = parent ? rubyFqnOf(parent.id) : null;
+        if (unavailable.has(owner) || [...unavailable].some(path => owner.startsWith(`${path}::`) || parentFqn === path) ||
+            (parentFqn && rubyLinearize(parentFqn, rubyHeritage).chain.some(scope => unavailable.has(scope)))) {
+          invalid.add(owner); grew = true;
+        }
+      }
+      if (!grew) break;
+    }
+    if (invalid.size) {
+      const rejected = new Set(nodes.filter(node => {
+        const fqn = RB_EXT.test(node.path) ? rubyFqnOf(node.id) : null;
+        return fqn && [...invalid].some(path => fqn === path || fqn.startsWith(`${path}::`));
+      }).map(node => node.id));
+      for (const edge of dependentDefinitions) if (dependsOnInvalid(edge)) rejected.add(edge.targetId!);
+      const retained = rawEdges.filter(edge => !dependsOnInvalid(edge) && !rejected.has(edge.source) && (!edge.targetId || !rejected.has(edge.targetId)))
+        .map(edge => edge.rubyClassFactory ? { ...edge, rubyClassFactory: undefined } : edge);
+      const withdrawnConstants = new Set([...invalid, ...nodes.filter(node => rejected.has(node.id) && (node.kind === "class" || node.kind === "module")).map(node => rubyFqnOf(node.id)!)]);
+      for (const owner of withdrawnConstants) retained.push({ source: factories[0].file, file: factories[0].file,
+        relation: "references", name: `::${owner}`, nesting: [], rubyConstDecl: true });
+      return resolveEdges(nodes.filter(node => !rejected.has(node.id)), retained, opts);
+    }
+  }
+
   // Which classes are ActiveRecord models — the precondition for reading `first`,
   // `find` and `create` as the framework's finders rather than as somebody's own
   // class method. Closed over the resolved superclass chain AND the unresolved
   // name at its end, since the chain always terminates in a gem.
+  const rubyJobs = collectRubyDescendants(rubyHeritage, rubyExternalSupers, new Set(["ActiveJob::Base", "::ActiveJob::Base"]));
+  const rubyMailboxes = collectRubyDescendants(rubyHeritage, rubyExternalSupers, new Set(["ActionMailbox::Base", "::ActionMailbox::Base"]));
   const rubyModels = collectRubyDescendants(rubyHeritage, rubySuperNames, AR_BASE_NAMES);
   // The classes whose class-level calls fall through to an instance. See
   // `AS_CURRENT_ATTRIBUTES_NAMES`.
@@ -557,14 +757,281 @@ export function resolveEdges(
 
   const out: EdgeV1[] = [];
   const seen = new Set<string>();
-  const add = (source: string, target: string, relation: Relation, confidence: EdgeV1["confidence"]) => {
+  const add = (source: string, target: string, relation: Relation, confidence: EdgeV1["confidence"], via?: string) => {
     const key = `${source}\0${relation}\0${target}`;
     if (seen.has(key)) return;
     seen.add(key);
-    out.push({ source, target, relation, confidence });
+    out.push({ source, target, relation, confidence, ...(via ? { via } : {}) });
+  };
+
+  // A class node may survive a later constant assignment in the same static
+  // index. Workflow targets cannot use that stale identity, nor a child of a
+  // reassigned namespace, even if ordinary constant lookup finds the old node.
+  const workflowShadowPaths = new Set([...rubyShadow, ...rubyWorkflowUncertainShadows]);
+  const workflowShadowed = (fqn: string): boolean => {
+    const parts = fqn.split("::");
+    return parts.some((_, i) => workflowShadowPaths.has(parts.slice(0, i + 1).join("::")));
+  };
+  const workflowNamespaceChanged = (fqn: string): boolean =>
+    workflowShadowed(fqn) || [...workflowShadowPaths].some(path => path.startsWith(`${fqn}::`));
+
+  // An instance chain alone omits extended modules. Their included ancestors can
+  // supply singleton methods, so workflow gates must inspect both lookup chains
+  // before treating an absent override as proof that a framework entrypoint wins.
+  const workflowScopesCache = new Map<string, readonly string[] | null>();
+  const workflowScopes = (owner: string): readonly string[] | null => {
+    if (workflowScopesCache.has(owner)) return workflowScopesCache.get(owner)!;
+    const scopes = new Set<string>();
+    const pending = [owner];
+    while (pending.length) {
+      const scope = pending.pop()!;
+      if (scopes.has(scope)) continue;
+      if (workflowShadowed(scope)) { workflowScopesCache.set(owner, null); return null; }
+      if (scopes.size >= RUBY_ANCESTOR_CAP) { workflowScopesCache.set(owner, null); return null; }
+      scopes.add(scope);
+      const h = rubyHeritage.get(scope) ?? EMPTY_HERITAGE;
+      pending.push(...h.prepends, ...h.includes, ...h.supers, ...h.extends);
+      // M3 models a concern's class_methods module as a singleton lookup step.
+      if (rubyModuleFqns.has(scope)) pending.push(`${scope}::ClassMethods`);
+    }
+    const result = [...scopes];
+    workflowScopesCache.set(owner, result);
+    return result;
+  };
+
+  // GoodJob 4.19.2 Concurrency installs enqueue/perform guards; its Labels
+  // dependency prepends enqueue only to set labels and call super. Those hooks
+  // can abort or retry, but preserve the ActiveJob perform target. Other versions
+  // and local shadows have no such evidence. This exception belongs solely to
+  // job entrypoint resolution, never Ruby super or general method dispatch.
+  const jobMixinEvidence = (chain: readonly string[]): string | null => {
+    let goodJob = false;
+    for (const scope of chain) for (const mixin of rubyUnknownMixinNames.get(scope) ?? []) {
+      if (!mixin.external || workflowShadowed(mixin.name)) return null;
+      if (mixin.kind === "extend" && mixin.name === "ActiveSupport::Concern") continue;
+      if (opts.goodJobVersion === "4.19.2" && mixin.kind === "include" &&
+          (mixin.name === "GoodJob::ActiveJobExtensions::Concurrency" || mixin.name === "GoodJob::ActiveJobExtensions::Labels")) {
+        // Concurrency's pinned contract also includes Labels and Concern. A local
+        // replacement in either dependency invalidates that package evidence.
+        if (["GoodJob::ActiveJobExtensions::Concurrency", "GoodJob::ActiveJobExtensions::Labels", "ActiveSupport::Concern"].some(workflowNamespaceChanged)) return null;
+        goodJob = true;
+        continue;
+      }
+      return null;
+    }
+    return goodJob ? "; GoodJob 4.19.2 concurrency/labels guards may abort or retry" : "";
+  };
+
+  const workflowMethod = (owner: string, name: string, file: string, want: RubyValueKind = "instance") =>
+    resolveRubyOwnerMethod(owner, name, file, rubyOwnerMethod, rubyDispatch, want, true);
+  // Reuse the ancestry index across call sites; scanning every class for every
+  // bare word made inherited-hook discovery quadratic in a Rails application's
+  // method count. Unknown mixins keep the corresponding receivers out entirely.
+  const workflowReceivers = new Map<string, string[]>();
+  for (const candidate of rubyFqn.keys()) {
+    if (rubyModuleFqns.has(candidate) || workflowShadowed(candidate)) continue;
+    const chain = rubyLinearize(candidate, rubyHeritage);
+    const scopes = workflowScopes(candidate);
+    if (chain.truncated || !scopes || scopes.some(scope => rubyUnknownMixins.has(scope))) continue;
+    for (const owner of chain.chain) push(workflowReceivers, owner, candidate);
+  }
+
+  // A module's `super` depends on its includer, so its lexical ancestry cannot
+  // answer. For class methods, continue after the defining owner in Ruby's
+  // matching chain; unknown mixins may intercept and therefore stop resolution.
+  const superTarget = (edge: RawEdge): string | null => {
+    const owner = edge.rubyOwnerFqn;
+    const method = byId.get(edge.source);
+    if (!owner || !method || method.kind !== "method" || rubyModuleFqns.has(owner) || !method.receiver) return null;
+    const scopes = workflowScopes(owner);
+    if (!scopes || scopes.some(scope => rubyUnknownMixins.has(scope) || workflowShadowed(scope))) return null;
+    const walk = method.receiver === "instance" ? rubyLinearize(owner, rubyHeritage) : null;
+    const singleton = method.receiver === "class" ? rubySingletonChain(owner, rubyDispatch) : null;
+    if (walk?.truncated || singleton?.truncated) return null;
+    const steps: RubyLookupStep[] = walk ? walk.chain.map(scope => ({ scope, want: "instance" })) : singleton!.steps;
+    const start = steps.findIndex(step => step.scope === owner && step.want === method.receiver);
+    if (start < 0) return null;
+    for (const step of steps.slice(start)) {
+      if (rubyUnknownMixins.has(step.scope)) return null;
+      if (step.scope === owner) continue;
+      const candidates = (rubyOwnerMethod.get(`${step.scope}#${method.name}`) ?? []).filter(n => rubyNodeAnswers(n, step.want) && (!step.synthesizedOnly || n.origin === "synthesized"));
+      if (candidates.length) return candidates.length === 1 ? candidates[0].id : null;
+    }
+    return null;
+  };
+  const superTargets = new Map<string, string>();
+  for (const edge of rawEdges) if (edge.rubySuper) {
+    const target = superTarget(edge);
+    if (target) superTargets.set(edge.source, target);
+  }
+  const reachesBody = (entry: string, body: string): boolean => {
+    const visited = new Set<string>();
+    for (let cur: string | undefined = entry; cur && !visited.has(cur); cur = superTargets.get(cur)) {
+      if (cur === body) return true;
+      visited.add(cur);
+    }
+    return false;
+  };
+
+  // A keyword default is only one possible binding. Record explicit call-site
+  // arguments separately so an override never inherits the default's class, and
+  // forwarding retains the source declaration that justified each candidate.
+  const bindingWriters = new Map<string, RawEdge[]>();
+  const bindingParameters = new Map<string, RawEdge[]>();
+  for (const edge of rawEdges) if (edge.rubyBinding) {
+    push(bindingWriters, edge.rubyBinding.key, edge);
+    if (edge.rubyBinding.parameter) push(bindingParameters, edge.source, edge);
+  }
+  const injectionOwnerSafe = (owner: string): boolean => {
+    const scopes = workflowScopes(owner);
+    return !!scopes && !rubyModuleFqns.has(owner) && scopes.every(scope =>
+      !rubyUnknownMixins.has(scope) && !(rubyExternalSupers.get(scope) ?? []).some(name => !["Object", "::Object", "BasicObject", "::BasicObject"].includes(name)));
+  };
+  const constructionSafe = (owner: string, file: string): boolean => injectionOwnerSafe(owner) &&
+    !workflowMethod(owner, "new", file, "class");
+  const flowOwner = (edge: RawEdge): string | null => {
+    if (edge.rubyRecvBase === "self") return edge.rubyOwnerFqn ?? null;
+    if (!edge.rubyRecvConst) return null;
+    const hit = constNode(resolveRubyConstant(edge.rubyRecvConst, edge.nesting ?? [], edge.file,
+      rubyFqn, rubyHeritage, rubyShadow, zeitwerk, true, "fqn"));
+    return hit ? rubyFqnOf(hit.id) : null;
+  };
+  const bindingCalls = new Map<string, RawEdge[]>();
+  const factoryOwnersWithDescendants = new Set<string>();
+  for (const owner of rubyHeritage.keys()) {
+    for (const ancestor of rubyLinearize(owner, rubyHeritage).chain) if (ancestor !== owner) factoryOwnersWithDescendants.add(ancestor);
+  }
+  const eligibleConstruction = (edge: RawEdge, owner: string): boolean => constructionSafe(owner, edge.file) &&
+    !(edge.rubyRecvBase === "self" && factoryOwnersWithDescendants.has(owner));
+  const activeInjectionSource = (edge: RawEdge): boolean => {
+    const source = byId.get(edge.source);
+    if (source?.kind !== "method") return true;
+    const fqn = rubyFqnOf(source.id);
+    const owner = fqn?.slice(0, fqn.lastIndexOf("::"));
+    if (!source.receiver || !owner) return false;
+    const active = workflowMethod(owner, source.name, edge.file, source.receiver);
+    return !!active && active !== "ambiguous" && active.id === source.id;
+  };
+  for (const edge of rawEdges) {
+    if (edge.relation !== "calls" || edge.rubyArguments === undefined || !edge.rubyRecvBase || edge.rubyRecvSteps?.length) continue;
+    if (!activeInjectionSource(edge)) continue;
+    const owner = flowOwner(edge);
+    if (!owner || !injectionOwnerSafe(owner)) continue;
+    const constructing = edge.name === "new" && edge.rubyRecvKind === "class";
+    const target = workflowMethod(owner, constructing ? "initialize" : edge.name!, edge.file,
+      constructing ? "instance" : edge.rubyRecvKind);
+    if (target && target !== "ambiguous" && bindingParameters.has(target.id)) {
+      // A rejected constructor still counts as an unknown incoming call. Dropping
+      // it entirely would revive an initializer default through the empty-set
+      // fallback, bypassing the same constructor that blocked the factory edge.
+      push(bindingCalls, target.id, (constructing || edge.rubyConstructed) && !eligibleConstruction(edge, owner)
+        ? { ...edge, rubyArguments: null } : edge);
+    }
+  }
+  type InjectionCandidate = { owner: string; proof: string[] };
+  const bindingCache = new Map<string, InjectionCandidate[]>();
+  const indexedRubyMethodNames = new Set([...rubyOwnerMethod.keys()].map(key => key.slice(key.lastIndexOf("#") + 1)));
+  const bindingCandidates = (key: string, seen = new Set<string>()): InjectionCandidate[] => {
+    if (seen.has(key) || seen.size >= 16) return [];
+    if (bindingCache.has(key)) return bindingCache.get(key)!;
+    const writers = bindingWriters.get(key) ?? [];
+    // Even two agreeing writers are not a single injection declaration. A later
+    // mutation or a writer in a reopened class must withdraw this inference.
+    if (writers.length !== 1) return [];
+    const writer = writers[0];
+    if (!writer.rubyOwnerFqn || !injectionOwnerSafe(writer.rubyOwnerFqn)) return [];
+    if (!activeInjectionSource(writer)) return [];
+    const binding = writer.rubyBinding!;
+    const name = key.split("|").at(-1)!;
+    // attr_writer/accessor synthesize a writer without an assignment AST. Its
+    // presence makes the injected slot mutable just like a second written def.
+    if (name.startsWith("@") && workflowMethod(writer.rubyOwnerFqn, `${name.slice(1)}=`, writer.file,
+      key.includes("%class|") ? "class" : "instance")) return [];
+    const next = new Set(seen).add(key);
+    const evaluate = (value: typeof binding.value): InjectionCandidate[] => {
+      if (!value) return [];
+      if ("binding" in value) return bindingCandidates(value.binding, next);
+      const hit = constNode(resolveRubyConstant(value.constant, value.nesting, value.file,
+        rubyFqn, rubyHeritage, rubyShadow, zeitwerk, true, "fqn"));
+      const owner = hit ? rubyFqnOf(hit.id) : null;
+      return owner && constructionSafe(owner, value.file) ? [{ owner, proof: [`${value.file}: ${value.constant}.new`] }] : [];
+    };
+    let candidates: InjectionCandidate[] = [];
+    if (binding.parameter) {
+      const calls = bindingCalls.get(writer.source) ?? [];
+      if (!calls.length) candidates = evaluate(binding.value).map(c => ({ ...c, proof: [...c.proof, `${writer.source} ${binding.parameter}: default`] }));
+      for (const call of calls) {
+        if (call.rubyArguments === null) continue;
+        const explicit = Object.hasOwn(call.rubyArguments!, binding.parameter);
+        const value = explicit ? call.rubyArguments![binding.parameter] : binding.value;
+        candidates.push(...evaluate(value).map(c => ({ ...c, proof: [...c.proof,
+          `${writer.source} ${binding.parameter}: ${explicit ? `argument from ${call.source}` : `default at ${call.source}`}`] })));
+      }
+    } else candidates = evaluate(binding.value).map(c => ({ ...c, proof: [...c.proof, `${writer.source} binds ${key.split("|").at(-1)}`] }));
+    // One complete source proof per candidate type is enough to justify the
+    // conditional edge. Keeping every equivalent caller path multiplies the
+    // output at each forwarding hop without proving any additional target.
+    candidates.sort((a, b) => a.proof.join("; ").localeCompare(b.proof.join("; ")));
+    const unique = [...new Map(candidates.map(c => [c.owner, c])).values()];
+    if (unique.length <= 16) bindingCache.set(key, unique);
+    return unique.length <= 16 ? unique : [];
   };
 
   for (const e of rawEdges) {
+    if (e.rubyReceiverBinding) {
+      if (!e.rubyOwnerFqn || !injectionOwnerSafe(e.rubyOwnerFqn) || !activeInjectionSource(e)) continue;
+      if (e.rubyBlockSteps?.some(step => indexedRubyMethodNames.has(step))) continue;
+      const candidates = new Map<string, string[]>();
+      for (const candidate of bindingCandidates(e.rubyReceiverBinding)) {
+        const target = workflowMethod(candidate.owner, e.name!, e.file, "instance");
+        if (target && target !== "ambiguous" && target.id !== e.source) push(candidates, target.id, candidate.proof.join("; "));
+      }
+      for (const [target, proofs] of candidates) add(e.source, target, "dispatches", "ruby_injection",
+        `Ruby conditional injection ${e.rubyReceiverBinding.split("|").at(-1)}: ${proofs.sort()[0]}${e.rubyBlockSteps?.length
+          ? `; conditional block self: ${e.rubyBlockArrayEvidence?.join("; ")}; Array#map${e.rubyBlockSteps.includes("first") ? " after Array#first(count)" : ""} preserves lexical self if that contract holds` : ""}`);
+      continue;
+    }
+    if (e.rubyConstructed) {
+      const owner = flowOwner(e);
+      // `new` inside an inherited class method uses the dynamic subclass. Its
+      // constructor or instance entrypoint may differ; the lexical class alone
+      // cannot justify an exclusive call when known descendants exist.
+      if (!owner || !eligibleConstruction(e, owner)) continue;
+    }
+    if (e.rubySuper) {
+      const target = superTargets.get(e.source);
+      if (target) add(e.source, target, "calls", "type_bound", "Ruby super: next implementation after the defining owner");
+      continue;
+    }
+    if (e.rubyMailbox) {
+      if (workflowShadowed("ActionMailbox::Base")) continue;
+      const owner = e.rubyOwnerFqn;
+      if (!owner || workflowShadowed(owner) || !rubyMailboxes.has(owner)) continue;
+      const ancestry = rubyLinearize(owner, rubyHeritage);
+      const scopes = workflowScopes(owner);
+      if (ancestry.truncated || !scopes || scopes.some(scope => rubyUnknownMixins.has(scope))) continue;
+      if (workflowMethod(owner, e.rubyMailbox, e.file, "class")) continue;
+      const candidates = e.rubyMailbox === "routing" ? [e.name!] : [...rubyMailboxes].filter(candidate => rubyLinearize(candidate, rubyHeritage).chain.includes(owner));
+      for (const targetOwner of candidates) {
+        if (workflowShadowed(targetOwner) || !rubyMailboxes.has(targetOwner) || (rubyFqn.get(targetOwner)?.length ?? 0) !== 1) continue;
+        const identity = resolveRubyConstant(`::${targetOwner}`, [], e.file, rubyFqn, rubyHeritage, rubyShadow, zeitwerk, true);
+        if (!identity || identity === "stopped" || rubyFqnOf(identity.id) !== targetOwner) continue;
+        const chain = rubyLinearize(targetOwner, rubyHeritage);
+        const targetScopes = workflowScopes(targetOwner);
+        if (chain.truncated || !targetScopes || targetScopes.some(scope => rubyUnknownMixins.has(scope))) continue;
+        const method = e.rubyMailbox === "routing" ? "process" : e.name!;
+        const hit = workflowMethod(targetOwner, method, e.file);
+        if (hit && hit !== "ambiguous") {
+          add(e.source, hit.id, "dispatches", "convention", `ActionMailbox.${e.rubyMailbox}: conditional receiver ${targetOwner}#${method}`);
+          if (e.rubyMailbox !== "routing") {
+            const process = workflowMethod(targetOwner, "process", e.file);
+            if (process && process !== "ambiguous" && process.id !== hit.id) add(process.id, hit.id, "dispatches", "convention",
+              `ActionMailbox processing lifecycle: ${e.rubyMailbox} for receiver ${targetOwner}; declared at ${e.source}`);
+          }
+        }
+      }
+      continue;
+    }
     // A type carrier states a fact for the pre-passes above and is not a
     // dependency the source file contains. See `RawEdge.rubyTypeOnly`.
     if (e.rubyTypeOnly) continue;
@@ -715,6 +1182,54 @@ export function resolveEdges(
       // convention that names a file which is not there has not found anything.
       if (target && railsTemplates.has(target)) add(e.source, target, "renders", "extracted");
     } else if (e.relation === "calls") {
+      if (e.rubyJob) {
+        if (workflowShadowed("ActiveJob::Base")) continue;
+        const constant = resolveRubyConstant(e.rubyRecvConst!, e.nesting ?? [], e.file, rubyFqn, rubyHeritage, rubyShadow, zeitwerk, true);
+        const owner = constant && constant !== "stopped" ? rubyFqnOf(constant.id) : null;
+        if (!owner || workflowShadowed(owner)) continue;
+        if (!rubyJobs.has(owner)) {
+          const direct = resolveRubyTypedCall(e, rubyOwnerMethod, rubyDispatch, rubyReturns, rubyModels, rubyFqn, rubyShadow, zeitwerk);
+          if (!e.rubyJobConfigured && direct && direct !== "ambiguous") add(e.source, direct.id, "calls", "type_bound");
+          continue;
+        }
+        const chain = rubyLinearize(owner, rubyHeritage);
+        const scopes = workflowScopes(owner);
+        const mixinEvidence = scopes ? jobMixinEvidence(scopes) : null;
+        if (chain.truncated || mixinEvidence === null) continue;
+        const override = workflowMethod(owner, e.rubyJob, e.file, "class");
+        if (e.rubyJobConfigured && workflowMethod(owner, "set", e.file, "class")) continue;
+        if (override) {
+          if (override !== "ambiguous" && !e.rubyJobConfigured) add(e.source, override.id, "calls", "type_bound");
+          continue;
+        }
+        // Queued execution also invokes instance perform_now. An override there
+        // can replace perform entirely, even when class perform_later is inherited.
+        if (workflowMethod(owner, "perform_now", e.file, "instance")) continue;
+        if (e.rubyJob === "perform_later" && workflowMethod(owner, "enqueue", e.file, "instance")) continue;
+        const hit = workflowMethod(owner, "perform", e.file, "instance");
+        if (hit && hit !== "ambiguous") add(e.source, hit.id, e.rubyJob === "perform_later" ? "enqueues" : "dispatches", "convention",
+          `ActiveJob.${e.rubyJobConfigured ? "set(...)." : ""}${e.rubyJob}: ${owner}#perform${e.rubyJob === "perform_later" ? " may execute asynchronously after enqueue callbacks" : " may execute through callbacks"}${mixinEvidence}`);
+        continue;
+      }
+      if (e.rubyRecvBase === "self" && e.rubyOwnerFqn && !e.rubyRecvSteps?.length && byId.get(e.source)?.kind === "method") {
+        const owner = e.rubyOwnerFqn;
+        const source = byId.get(e.source)!;
+        if (!rubyModuleFqns.has(owner) && source.receiver && e.rubyRecvKind === source.receiver) {
+          const targets = new Map<string, string[]>();
+          for (const candidate of workflowReceivers.get(owner) ?? []) {
+            const entry = workflowMethod(candidate, source.name, e.file, source.receiver);
+            if (!entry || entry === "ambiguous" || !reachesBody(entry.id, source.id)) continue;
+            const hit = workflowMethod(candidate, e.name!, e.file, source.receiver);
+            if (hit && hit !== "ambiguous") push(targets, hit.id, candidate);
+          }
+          const lexical = workflowMethod(owner, e.name!, e.file, source.receiver);
+          if (targets.size > 1 || (targets.size === 1 && (!lexical || lexical === "ambiguous" || !targets.has(lexical.id)))) {
+            for (const [target, receivers] of targets) if (target !== e.source) add(e.source, target, "dispatches", "ruby_dispatch",
+              `Ruby self.${e.name}: possible receiver ${receivers.join(", ")} (known receivers only)`);
+            continue;
+          }
+        }
+      }
       if (e.rubyRecvBase) {
         // M3: the receiver's type is known, so the method is looked up on that
         // class and its own Ruby ancestors — never by name across the repo.
@@ -1416,6 +1931,7 @@ function resolveRubyOwnerMethod(
   index: Map<string, NodeV1[]>,
   dispatch: RubyDispatch,
   want: RubyValueKind = "instance",
+  strict = false,
 ): { id: string; confidence: EdgeV1["confidence"] } | "ambiguous" | null {
   const instanceSteps = (): RubyLookupStep[] | null => {
     const walk = rubyLinearize(ownerFqn, dispatch.heritage);
@@ -1443,6 +1959,7 @@ function resolveRubyOwnerMethod(
     if (!all || all.length === 0) continue;
     const cands = all.filter((c) => rubyNodeAnswers(c, step.want) && (!step.synthesizedOnly || c.origin === "synthesized"));
     if (cands.length === 0) continue;
+    if (strict && cands.length > 1) return "ambiguous";
     const sameFile = cands.filter((c) => c.path === file);
     // `type_bound` either way (M3). Both readings came from a KNOWN receiver
     // class, and the same-file/cross-file split that separates `extracted` from

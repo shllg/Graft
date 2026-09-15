@@ -19,12 +19,18 @@ import Swift from "tree-sitter-swift";
 import PHP from "tree-sitter-php";
 import { basename } from "node:path";
 import { contentHash } from "../util/id.js";
-import { associationConstant } from "./zeitwerk.js";
+import { associationConstant, camelize } from "./zeitwerk.js";
 import {
   collectBindings,
   rubyMethodReturnType,
   rubyConstructorType,
+  rubyConstructionHasBlock,
   rubyScopeKey,
+  rubyBlockSelfContext,
+  rubyNamedClassFactory,
+  rubyUnknownFactoryBlock,
+  rubyBlockClassScope,
+  rubyBindingDeclarations,
   goReceiverVarOf,
   resolveRecvType,
   cppDeclaratorName,
@@ -129,6 +135,14 @@ export function languageLabelOf(path: string): string | null {
  * matching `name`/`specifier` against the repo-wide node index.
  */
 export interface RawEdge {
+  /** Keyword injection is conditional dataflow, never an exclusive variable type.
+   * Keep the declaration/call site until constants and method owners are resolved. */
+  rubyBinding?: { key: string; value: RubyBindingValue | null; parameter?: string };
+  rubyArguments?: Record<string, RubyBindingValue | null> | null;
+  rubyReceiverBinding?: string;
+  rubyBlockSteps?: Array<"first" | "map">;
+  rubyBlockArrayEvidence?: string[];
+  rubyConstructed?: boolean;
   source: string; // resolved node id
   relation: Relation;
   file: string; // the file this edge originates in (scopes name resolution)
@@ -198,6 +212,21 @@ export interface RawEdge {
    * records the FQN and declines rather than resolving past it to an unrelated
    * top-level class. Ruby finds the constant here; we simply cannot name it. */
   rubyConstDecl?: boolean;
+  /** Syntactically named Class.new superclass. Validation waits for the complete
+   * constant index; a shadowed factory never supplies dispatch or heritage. */
+  rubyClassFactory?: boolean;
+  /** A mutation of a statically named class object, retained even when the
+   * mutating call itself cannot resolve to an indexed method. */
+  rubyClassMutation?: boolean;
+  /** Factory blocks can declare constants in their outer lexical namespace.
+   * Their syntax still depends on the factory executing; semantic ownership
+   * alone cannot withdraw those declarations when the factory is rejected. */
+  rubyFactoryDependencies?: string[];
+  /** Validation-only class-object aliases. They never establish instance types
+   * or executable targets; every possible writer can invalidate a factory. */
+  rubyConstAlias?: RubyBindingValue;
+  rubyClassAliasBinding?: { key: string; value: RubyBindingValue | null };
+  rubyClassMutationBinding?: string;
   /** Ruby only: the fully-qualified name of the class this edge was declared in
    * (`Api::V1::User`), for the macro edges whose receiver is that class and is known
    * exactly. The generic `recvType` is a BARE class name shared across every
@@ -229,6 +258,12 @@ export interface RawEdge {
    * the milestone's whole point: `e.message` used to resolve, by unique name, to
    * a ViewComponent's `attr_reader :message`, 161 times. */
   rubyRecvBase?: "self" | "const";
+  rubySuper?: boolean;
+  /** An include/prepend/extend argument was not a constant; retain the barrier. */
+  rubyHeritageUnknown?: boolean;
+  rubyJob?: "perform_later" | "perform_now";
+  rubyJobConfigured?: boolean;
+  rubyMailbox?: "routing" | "before_processing" | "after_processing" | "around_processing";
   /** Ruby only (M3): the receiver's class as WRITTEN (`User`, `Api::V1::Job`,
    * `::Top::Thing`), for `rubyRecvBase === "const"`. Paired with `nesting`, since
    * what a constant names depends on where it is written. */
@@ -320,6 +355,8 @@ export interface RawEdge {
    * template's bare words are resolved against. */
   railsHelperExport?: boolean;
 }
+
+export type RubyBindingValue = { binding: string } | { constant: string; file: string; nesting: string[] };
 
 export interface ExtractResult {
   nodes: NodeV1[];
@@ -603,6 +640,8 @@ export interface WalkCtx {
   // its body cannot see `A::B` or `A`. Both spellings occur in real Rails code
   // and they are not interchangeable — see rubyCref().
   rubyNesting: readonly string[];
+  // Class.new blocks keep their lexical cref while methods use the new owner.
+  rubyOwner: string | undefined;
   // Ruby (M2): the Rails context, or null when this repo is not a Rails app.
   // Its PRESENCE is the gate on the whole ActiveRecord/ActiveSupport vocabulary —
   // `has_many :items` in a plain gem is an ordinary call to a method the repo
@@ -741,6 +780,7 @@ export function extractFile(rel: string, source: string, lang: Language, opts: E
     rubyVisibility: "public",
     rubyPostHoc: EMPTY_MAP,
     rubyNesting: EMPTY_NESTING,
+    rubyOwner: undefined,
     rubyRails: opts.rails ?? null,
     railsIvarRole: opts.rails ? railsIvarRole(rel) : null,
     rubyIncludedBlock: false,
@@ -885,6 +925,12 @@ function emitPhpCollapsedEnum(
 }
 
 function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEdge[], minted: Set<string>): void {
+  if (ctx.lang === "ruby") {
+    if (rubyUnknownFactoryBlock(node)) return;
+    const mutation = rubyClassMutationTarget(node, ctx);
+    if (mutation) edges.push({ source: ctx.parentId, relation: "references", file: ctx.rel,
+      ...mutation, nesting: [...ctx.rubyNesting], rubyClassMutation: true, rubyTypeOnly: true });
+  }
   // A block written in a class body, whose method this pass does not recognize.
   // minitest's `test "…" do … end` becomes an INSTANCE method; Rails' `included do …
   // end` runs in the includer's class body; the syntax is identical and only the
@@ -895,14 +941,24 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
   // DOES recognize (`included do`, `class_methods do`, a `scope` lambda, a
   // `define_method` body) never reach here: each is consumed by a branch below that
   // walks the block's CHILDREN with the reading it knows to be right.
-  if (ctx.lang === "ruby" && ctx.rubySelfKind === "class" && (node.type === "do_block" || node.type === "block")) {
-    walkNamedChildren(node.namedChildren, { ...ctx, rubySelfKind: "unknown" }, out, edges, minted);
+  if (ctx.lang === "ruby" && (rubyBlockSelfContext(node, ctx.rubySelfKind) !== ctx.rubySelfKind || rubyBlockClassScope(node, ctx.rubyClassScope) !== ctx.rubyClassScope)) {
+    walkNamedChildren(node.namedChildren, { ...ctx, rubySelfKind: rubyBlockSelfContext(node, ctx.rubySelfKind),
+      rubyClassScope: rubyBlockClassScope(node, ctx.rubyClassScope) }, out, edges, minted);
     return;
   }
   // M4: the controller↔template instance-variable contract. Emitted here, before
   // anything consumes the node, because `@documents = …` is an assignment rather than
   // a call and the branches below never see it as one.
   if (ctx.rubyRails && ctx.railsIvarRole) rubyIvarEdges(node, ctx, edges);
+  // A class declaration inside Class.new's block writes into the lexical
+  // namespace, not the anonymous class's self. Keep ids aligned with that same
+  // cref; constant lookup alone cannot repair a wrongly owned definition node.
+  if (ctx.lang === "ruby" && ctx.rubyOwner !== ctx.rubyNesting[0] &&
+      (node.type === "class" || node.type === "module" || rubyNamedClassFactory(node))) {
+    const scope = ctx.rubyNesting[0]?.split("::") ?? [];
+    const parentId = scope.length ? `${ctx.rel}#${scope.join(".")}` : ctx.rel;
+    ctx = { ...ctx, scope, parentId };
+  }
   const desc = describe(node, ctx);
   if (desc) {
     // `idName` scopes the id (e.g. a Go method under its receiver: `#DB.Count`) while
@@ -988,6 +1044,8 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
         : isGoMethod
           ? goReceiverType(node)
           : (desc.owner ?? ctx.enclosingClass);
+    const rubyFactory = ctx.lang === "ruby" ? rubyNamedClassFactory(node) : null;
+    const rubyBodyOwner = rubyFactory?.block ?? node;
     const childCtx: WalkCtx = {
       ...ctx,
       scope: [...ctx.scope, idPart],
@@ -1026,14 +1084,17 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
         ctx.lang === "ruby" && (desc.kind === "class" || desc.kind === "module") ? "public" : ctx.rubyVisibility,
       rubyPostHoc:
         ctx.lang === "ruby" && (desc.kind === "class" || desc.kind === "module")
-          ? rubyPostHocVisibility(node)
+          ? rubyPostHocVisibility(rubyBodyOwner)
           : ctx.rubyPostHoc,
       rubyOwnDefs:
         ctx.lang === "ruby" && (desc.kind === "class" || desc.kind === "module")
-          ? rubyOwnDefNames(node)
+          ? rubyOwnDefNames(rubyBodyOwner)
           : ctx.rubyOwnDefs,
-      rubyNesting:
+      rubyOwner:
         ctx.lang === "ruby" && (desc.kind === "class" || desc.kind === "module")
+          ? rubyCref(ctx.rubyNesting[0], idPart) : ctx.rubyOwner,
+      rubyNesting:
+        ctx.lang === "ruby" && !rubyFactory && (desc.kind === "class" || desc.kind === "module")
           ? [rubyCref(ctx.rubyNesting[0], idPart), ...ctx.rubyNesting]
           : ctx.rubyNesting,
       // A class defined inside an `included do` block is its own subject; the
@@ -1055,7 +1116,7 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
       // is handled in the body walk, exactly as `private` is.
       rubyModuleFunction:
         ctx.lang === "ruby" && (desc.kind === "class" || desc.kind === "module")
-          ? rubyExtendsSelf(node)
+          ? rubyExtendsSelf(rubyBodyOwner)
           : ctx.rubyModuleFunction,
       rubySelfKind:
         ctx.lang !== "ruby"
@@ -1086,8 +1147,30 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
         });
       }
     }
-    walkNamedChildren(node.namedChildren, childCtx, out, edges, minted);
+    const bodyNodeStart = out.length;
+    const bodyEdgeStart = edges.length;
+    walkNamedChildren(rubyFactory ? rubyFactory.block?.namedChildren ?? [] : node.namedChildren, childCtx, out, edges, minted);
+    if (rubyFactory) {
+      for (let i = bodyEdgeStart; i < edges.length; i++) {
+        edges[i].rubyFactoryDependencies = [...(edges[i].rubyFactoryDependencies ?? []), id];
+      }
+      for (let i = bodyNodeStart; i < out.length; i++) edges.push({ source: id, targetId: out[i].id,
+        relation: "contains", file: ctx.rel, rubyTypeOnly: true, rubyFactoryDependencies: [id] });
+    }
     return;
+  }
+
+  if (ctx.lang === "ruby") {
+    for (const declaration of rubyBindingDeclarations(node)) {
+      const { name, value, parameter } = declaration;
+      if (name.startsWith("@@") || name.startsWith("$")) continue;
+      const single = ctx.bindings.hasSingleRubyWrite(rubyScopeKey(name, ctx.scope, ctx.rubyClassScope, ctx.rubySelfKind), name);
+      edges.push({ source: ctx.parentId, file: ctx.rel, relation: "references", rubyTypeOnly: true,
+        rubyOwnerFqn: ctx.rubyOwner,
+        rubyClassAliasBinding: { key: rubyBindingKey(name, ctx), value: rubyClassAliasValue(value, ctx) },
+        rubyBinding: { key: rubyBindingKey(name, ctx), ...(parameter ? { parameter } : {}),
+          value: single && (parameter || node.type === "assignment") ? rubyBindingValue(value, ctx) : null } });
+    }
   }
 
   // C++ visibility is stateful: an `access_specifier` token inside a class/struct
@@ -1143,6 +1226,12 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
   // there's no separate import-statement grammar construct to key off, so isImport
   // must be checked before the generic calls path or every import call would be
   // captured as a (harmlessly unresolvable, but wrong) `calls` edge instead.
+  // Bare `super` is its own AST node; parenthesized forms wrap that node in a
+  // call. Capture the keyword once, retaining the enclosing method's identity.
+  if (ctx.lang === "ruby" && node.type === "super" && ctx.rubyOwner) {
+    edges.push({ source: ctx.parentId, relation: "calls", name: ctx.scope.at(-1), file: ctx.rel,
+      rubySuper: true, rubyOwnerFqn: ctx.rubyOwner, rubyRecvKind: ctx.rubySelfKind });
+  }
   const callTypes = CALL_TYPES[ctx.lang];
   if (isImport(node, ctx.lang)) {
     const spec = importSpecifier(node, ctx.lang);
@@ -1159,6 +1248,11 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
     // function literally named "R6Class"/"list".
     const rubyMixins = ctx.lang === "ruby" && ctx.enclosingClass !== null ? rubyMixinTargets(node) : null;
     if (rubyMixins) {
+      if (rubyMixins.unknown) edges.push({
+        source: ctx.parentId, relation: "extends", file: ctx.rel,
+        nesting: [...ctx.rubyNesting], rubyOwnerFqn: ctx.rubyOwner,
+        rubyHeritage: rubyMixins.keyword, rubyHeritageUnknown: true, rubyTypeOnly: true,
+      });
       for (const target of rubyMixins.targets) {
         edges.push({
           source: ctx.parentId,
@@ -1168,6 +1262,11 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
           nesting: [...ctx.rubyNesting],
           rubyHeritage: rubyMixins.keyword,
         });
+      }
+      // Retaining the unresolved composition must not swallow calls that compute
+      // its argument, such as a locally defined factory().
+      if (rubyMixins.unknown) for (const child of node.childForFieldName("arguments")?.namedChildren ?? []) {
+        walk(child, ctx, out, edges, minted);
       }
       return;
     }
@@ -1284,6 +1383,7 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
         file: ctx.rel,
         ...(callee.kinds ? { kinds: callee.kinds } : {}),
       };
+      if (ctx.lang === "ruby") callEdge.rubyArguments = rubyKeywordArguments(node, ctx);
       // Overloading languages: the call site's argument count, to pick the right
       // overload (see RawEdge.argCount).
       const argCount =
@@ -1343,7 +1443,7 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
     // the receiver position safe to include — `organization.id` really does call
     // `attr_reader :organization`, and the two real call sites of filewerk's
     // `BulkActionsService#organization` are exactly that shape.
-    const own = ctx.rubyNesting[0];
+    const own = ctx.rubyOwner;
     edges.push({
       source: ctx.parentId,
       relation: "calls",
@@ -1385,21 +1485,22 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
         file: ctx.rel,
         nesting: [...ctx.rubyNesting],
       });
-    } else if (node.type === "constant" && isRubyConstantAssignment(node)) {
+    } else if (isRubyConstantAssignment(node)) {
       // `MAX = 10` defines a constant that no node can represent — the value is an
       // integer, not a symbol. It still SHADOWS: `X` inside `module A` that declares
       // `X = 123` is `A::X`, and must never resolve to an unrelated top-level
       // `class X`. Recording the declaration lets resolve.ts stop at the level Ruby
-      // stops at instead of walking past it. Bare names only: a qualified
-      // `A::X = 1` would need its own head resolved to know what it declares, and
-      // the shadowing case that actually occurs in Rails code is the bare one.
+      // stops at instead of walking past it. Qualified assignments retain their
+      // path too: resolve.ts resolves the namespace before recording the terminal
+      // identity, so `A::Job = object` cannot leave an old workflow target alive.
       edges.push({
         source: ctx.parentId,
         relation: "references",
-        name: node.text,
+        name: rubyConstPath(node)!,
         file: ctx.rel,
         nesting: [...ctx.rubyNesting],
         rubyConstDecl: true,
+        rubyConstAlias: rubyClassAliasValue(node.parent?.childForFieldName("right") ?? null, ctx) ?? undefined,
       });
     }
     return;
@@ -2317,7 +2418,16 @@ function rRoxygenExported(node: Parser.SyntaxNode): boolean | null {
  * in Phase 2). Unlike R, Ruby's grammar hands us real class/module nodes
  * directly — there's no S3/S4-style naming-convention inference to do here.
  */
+function rubyHeaderEnd(body: Parser.SyntaxNode | null, fallback: Parser.SyntaxNode): number {
+  // Comment-only and semicolon-empty definitions have no body node. Their terminal
+  // syntax node is the declaration header, not the comment or statement separator.
+  return body?.startIndex ?? fallback.endIndex;
+}
+
 function describeRuby(node: Parser.SyntaxNode, ctx: WalkCtx): DefDescriptor | null {
+  const factory = rubyNamedClassFactory(node);
+  if (factory) return { name: factory.name, kind: "class", hashNode: node,
+    headerEnd: factory.block?.startIndex ?? node.endIndex };
   if (node.type === "class" || node.type === "module") {
     const nameNode = node.childForFieldName("name");
     if (!nameNode) return null;
@@ -2337,27 +2447,28 @@ function describeRuby(node: Parser.SyntaxNode, ctx: WalkCtx): DefDescriptor | nu
     if (path === null) return null;
     const segs = path.replace(/^::/, "").split("::");
     const body = node.childForFieldName("body");
-    const hashNode = body ?? node;
+    const header = node.childForFieldName("superclass") ?? nameNode;
     return {
       name: segs[segs.length - 1],
       ...(segs.length > 1 ? { idName: segs.join(".") } : {}),
       kind: node.type === "class" ? "class" : "module",
-      headerEnd: (body ?? node).startIndex,
-      hashNode,
+      headerEnd: rubyHeaderEnd(body, header),
+      hashNode: node,
     };
   }
   if (node.type === "method") {
     const nameNode = node.childForFieldName("name");
     if (!nameNode) return null;
     const body = node.childForFieldName("body");
+    const header = node.childForFieldName("parameters") ?? nameNode;
     return {
       name: nameNode.text,
       // A `def` promotes to "method" only when lexically nested inside a
       // class/module — a top-level `def` is a free function for our
       // purposes, mirroring Python's own function→method promotion.
       kind: ctx.enclosingClass !== null ? "method" : "function",
-      headerEnd: (body ?? node).startIndex,
-      hashNode: body ?? node,
+      headerEnd: rubyHeaderEnd(body, header),
+      hashNode: node,
       // `def x` is an instance method — unless it is written inside `class << self`,
       // which is Ruby's other spelling of `def self.x` and is how 312 of
       // dailywerk's class methods are declared.
@@ -2372,6 +2483,7 @@ function describeRuby(node: Parser.SyntaxNode, ctx: WalkCtx): DefDescriptor | nu
     const nameNode = node.childForFieldName("name");
     if (!nameNode) return null;
     const body = node.childForFieldName("body");
+    const header = node.childForFieldName("parameters") ?? nameNode;
     return {
       name: nameNode.text,
       // Owned by the enclosing class regardless of whether the receiver was
@@ -2379,14 +2491,43 @@ function describeRuby(node: Parser.SyntaxNode, ctx: WalkCtx): DefDescriptor | nu
       // scope is recognizing the shape, not modeling per-object singleton
       // methods distinctly.
       kind: "method",
-      headerEnd: (body ?? node).startIndex,
-      hashNode: body ?? node,
+      headerEnd: rubyHeaderEnd(body, header),
+      hashNode: node,
       // `def self.x` answers a call on the class OBJECT. `def obj.x` for some other
       // object answers neither reading of the enclosing class, so it is left
       // unstamped — "unknown", which matches either rather than claiming one.
       ...(rubySingletonIsSelf(node) ? { receiver: "class" as RubySelfKind } : {}),
     };
   }
+  return null;
+}
+
+/** Direct singleton definitions and metaprogramming can replace Class.new even
+ * without reopening `class Class`. Keep their named receiver as a barrier; the
+ * resolver checks its lexical identity using the same constant lookup as calls. */
+function rubyClassMutationTarget(node: Parser.SyntaxNode, ctx: WalkCtx): { name?: string; rubyClassMutationBinding?: string } | null {
+  let receiver: Parser.SyntaxNode | null = null;
+  if (node.type === "singleton_method" || node.type === "singleton_class") receiver = node.childForFieldName("object") ?? node.childForFieldName("value");
+  else if (node.type === "call" && ["define_singleton_method", "define_method", "alias_method", "remove_method", "undef_method", "class_eval", "class_exec", "module_eval", "module_exec", "instance_eval", "instance_exec", "prepend", "include", "extend", "const_set", "remove_const", "send", "public_send", "__send__"].includes(node.childForFieldName("method")?.text ?? "")) {
+    receiver = node.childForFieldName("receiver");
+    if ((!receiver || receiver.type === "self") && ctx.rubySelfKind === "class" && ctx.rubyOwner) return { name: `::${ctx.rubyOwner}` };
+  }
+  while (receiver?.type === "call") receiver = receiver.childForFieldName("receiver");
+  if (!receiver) return null;
+  const path = rubyConstPath(receiver);
+  if (path) return { name: path };
+  if (receiver.type === "identifier" && rubyIsVar(receiver, ctx)) return { rubyClassMutationBinding: rubyBindingKey(receiver.text, ctx) };
+  const type = rubyReceiverType(receiver, ctx);
+  return type?.base === "const" && type.kind === "class" && !type.steps.length ? { name: type.constPath } : null;
+}
+
+/** Alias evidence only invalidates Class.new assumptions. Following it must not
+ * turn a class object into an instance binding in the ordinary call resolver. */
+function rubyClassAliasValue(node: Parser.SyntaxNode | null, ctx: WalkCtx): RubyBindingValue | null {
+  if (!node) return null;
+  const constant = rubyConstPath(node);
+  if (constant) return { constant, file: ctx.rel, nesting: [...ctx.rubyNesting] };
+  if (node.type === "identifier" && rubyIsVar(node, ctx)) return { binding: rubyBindingKey(node.text, ctx) };
   return null;
 }
 
@@ -2627,7 +2768,7 @@ const RUBY_RECV_CHAIN_CAP = 4;
 /** A receiver whose class M3 can name: a base (the enclosing class, or a constant)
  * plus the reader calls applied to it before the call in question. */
 type RubyReceiver =
-  | { base: "self"; kind: RubyValueKind; steps: string[] }
+  | { base: "self"; kind: RubyValueKind; constructed?: boolean; steps: string[] }
   | { base: "const"; constPath: string; kind: RubyValueKind; finder?: string; steps: string[] };
 
 /**
@@ -2667,6 +2808,7 @@ function rubyReceiverType(node: Parser.SyntaxNode, ctx: WalkCtx): RubyReceiver |
     // A variable with no knowable type. NOT a call on self — reading it as one
     // would bind a parameter to a same-named accessor on its own class.
     if (rubyIsVar(node, ctx)) return null;
+    if (node.text === "new" && ctx.rubySelfKind === "class") return { base: "self", kind: "instance", constructed: true, steps: [] };
     return { base: "self", kind: ctx.rubySelfKind, steps: [node.text] };
   }
   if (node.type === "instance_variable" || node.type === "class_variable" || node.type === "global_variable") {
@@ -2679,13 +2821,17 @@ function rubyReceiverType(node: Parser.SyntaxNode, ctx: WalkCtx): RubyReceiver |
     const method = node.childForFieldName("method");
     if (method?.type !== "identifier") return null;
     const inner = node.childForFieldName("receiver");
+    if (method.text === "new" && rubyConstructionHasBlock(node)) return null;
+    if (method.text === "new" && ctx.rubySelfKind === "class" && (!inner || inner.type === "self")) {
+      return { base: "self", kind: "instance", constructed: true, steps: [] };
+    }
     // `User.new`, `User.find(1)` — a constructor or finder on a constant is an
     // INSTANCE of it, and collapsing it here is what lets `Post.new.blog.publish`
     // walk at all: as a bare step, `new` resolves to no node and the chain dies.
     // The argument shape decides: `User.first(2)` is an Array, not a User.
     if (inner && (inner.type === "constant" || inner.type === "scope_resolution")) {
       const fqn = rubyConstPath(inner);
-      const built = fqn === null ? null : rubyConstructorType(fqn, method.text, node.childForFieldName("arguments"), rubyTypeCtx(ctx));
+      const built = fqn === null ? null : rubyConstructorType(fqn, method.text, node, rubyTypeCtx(ctx));
       if (built) {
         return { base: "const", constPath: built.fqn, kind: built.kind, finder: built.finder, steps: [] };
       }
@@ -2746,8 +2892,9 @@ function rubySingletonIsSelf(node: Parser.SyntaxNode): boolean {
 function rubyRecvFields(recv: RubyReceiver, ctx: WalkCtx): Partial<RawEdge> | null {
   const steps = recv.steps.length > 0 ? { rubyRecvSteps: recv.steps } : {};
   if (recv.base === "self") {
-    const own = ctx.rubyNesting[0];
-    return own ? { rubyRecvBase: "self", rubyOwnerFqn: own, rubyRecvKind: recv.kind, ...steps } : null;
+    const own = ctx.rubyOwner;
+    return own ? { rubyRecvBase: "self", rubyOwnerFqn: own, rubyRecvKind: recv.kind,
+      ...(recv.constructed ? { rubyConstructed: true } : {}), ...steps } : null;
   }
   return {
     rubyRecvBase: "const",
@@ -2779,8 +2926,8 @@ function rubyRecvFields(recv: RubyReceiver, ctx: WalkCtx): Partial<RawEdge> | nu
  * stays for that fallback — a mixed-in module's method is a legitimate target and
  * `resolveName` cannot otherwise see it.
  *
- * `super(...)`'s implicit callee (no `method` field at all) returns null — no call
- * edge, matching the "erring toward false negatives" precedent.
+ * `super` is captured separately with its defining method, because its target is
+ * the next implementation in the ancestor chain rather than a method named super.
  */
 function rubyCallee(
   node: Parser.SyntaxNode,
@@ -2788,6 +2935,7 @@ function rubyCallee(
 ): { name: string; viaMember: boolean; kinds?: Kind[]; ruby?: Partial<RawEdge> } | null {
   const methodNode = node.childForFieldName("method");
   if (!methodNode) return null;
+  if (methodNode.type === "super") return null; // the keyword is captured by walk
   const name = rubyAssignedMethodName(node, methodNode.text);
   const receiverNode = node.childForFieldName("receiver");
   if (!receiverNode) {
@@ -2799,7 +2947,7 @@ function rubyCallee(
     // "method" on some unrelated class is not reachable that way, and matching one
     // is how a bare `warn` in a Falcon config file became a call into a rake
     // task's logger.
-    const own = ctx.rubyNesting[0];
+    const own = ctx.rubyOwner;
     if (!own) return { name, viaMember: false, kinds: ["function"] };
     return {
       name,
@@ -2808,11 +2956,127 @@ function rubyCallee(
       ruby: { rubyRecvBase: "self", rubyOwnerFqn: own, rubyRecvKind: ctx.rubySelfKind, implicitSelf: true },
     };
   }
+  // ActiveJob's configured proxy keeps its job class, but an ordinary `set`
+  // method need not. Carry the syntax; resolution verifies ancestry and overrides.
+  if (ctx.rubyRails && (name === "perform_later" || name === "perform_now")) {
+    const configured = receiverNode.type === "call" && receiverNode.childForFieldName("method")?.text === "set";
+    const base = configured ? receiverNode.childForFieldName("receiver") : receiverNode;
+    const job = base ? rubyConstPath(base) : null;
+    if (job) return { name, viaMember: true, ruby: {
+      rubyRecvBase: "const", rubyRecvConst: job, rubyRecvKind: "class", nesting: [...ctx.rubyNesting],
+      rubyJob: name, ...(configured ? { rubyJobConfigured: true } : {}),
+    } };
+  }
   const recv = rubyReceiverType(receiverNode, ctx);
-  if (!recv) return null; // the residual: no type, no edge
+  if (!recv) {
+    const binding = rubyBindingValue(receiverNode, ctx, true);
+    const block = rubyMapBlockEvidence(receiverNode, ctx);
+    return binding && "binding" in binding ? { name, viaMember: true,
+      ruby: { rubyReceiverBinding: binding.binding, rubyOwnerFqn: ctx.rubyOwner,
+        rubyBlockSteps: block?.steps, rubyBlockArrayEvidence: block?.evidence } } : null;
+  }
   const fields = rubyRecvFields(recv, ctx);
   if (!fields) return null;
   return { name, viaMember: true, ruby: fields };
+}
+
+function rubyBindingKey(name: string, ctx: WalkCtx): string {
+  return name.startsWith("@")
+    ? `${ctx.rubyOwner ?? ""}%${ctx.rubySelfKind}|${name}`
+    : `${ctx.parentId}|${name}`;
+}
+
+function rubyBindingReadAllowed(node: Parser.SyntaxNode, local: boolean): boolean {
+  for (let parent = node.parent; parent; parent = parent.parent) {
+    if (parent.type === "method" || parent.type === "singleton_method") break;
+    if (["block", "do_block", "lambda"].includes(parent.type)) {
+      if (local || rubyBlockSelfContext(parent, "instance") === "unknown") return false;
+    }
+  }
+  return true;
+}
+
+/** This annotation is a block-self contract only, never a general receiver type.
+ * Without an unchanged Array parameter (or literal Array), a method named map
+ * could just as well instance_exec the block on a foreign object. */
+function rubyArrayParameterEvidence(receiver: Parser.SyntaxNode, method: Parser.SyntaxNode, ctx: WalkCtx): string | null {
+  if (receiver.type !== "identifier" || !rubyIsVar(receiver, ctx) || rubyLookupVar(receiver, ctx) ||
+      !ctx.bindings.hasSingleRubyWrite(rubyScopeKey(receiver.text, ctx.scope, ctx.rubyClassScope, ctx.rubySelfKind), receiver.text)) return null;
+  const parameter = method.childForFieldName("parameters")?.namedChildren.find(p =>
+    (p.type === "identifier" ? p.text : p.childForFieldName("name")?.text) === receiver.text);
+  if (!parameter) return null;
+  const value = parameter.childForFieldName("value");
+  if (value && value.type !== "array") return null;
+  let nextRow = method.startPosition.row;
+  for (let comment = method.previousNamedSibling; comment?.type === "comment" && comment.endPosition.row + 1 >= nextRow; comment = comment.previousNamedSibling) {
+    const match = comment.text.match(/^#\s*@param\s+(\w+)\s+\[((?:::)?Array(?:<[^\]\n]+>)?)\](?:\s|$)/);
+    if (match?.[1] === receiver.text) return `annotation-derived @param ${receiver.text} [${match[2]}] at ${ctx.rel}:${comment.startPosition.row + 1}`;
+    nextRow = comment.startPosition.row;
+  }
+  return null;
+}
+
+function rubyMapBlockEvidence(node: Parser.SyntaxNode, ctx: WalkCtx): { steps: Array<"first" | "map">; evidence: string[] } | null {
+  const steps: Array<"first" | "map"> = [];
+  const evidence: string[] = [];
+  let method: Parser.SyntaxNode | null = node;
+  while (method && method.type !== "method" && method.type !== "singleton_method") method = method.parent;
+  for (let parent = node.parent; parent; parent = parent.parent) {
+    if (parent.type === "method" || parent.type === "singleton_method") break;
+    if (!["block", "do_block", "lambda"].includes(parent.type)) continue;
+    const call = parent.parent;
+    if (call?.type !== "call" || call.childForFieldName("method")?.text !== "map") return null;
+    let receiver = call.childForFieldName("receiver");
+    if (receiver?.type === "call" && receiver.childForFieldName("method")?.text === "first") {
+      const args = receiver.childForFieldName("arguments")?.namedChildren ?? [];
+      if (args.length !== 1 || args[0].type.includes("splat") || rubyConstructionHasBlock(receiver)) return null;
+      steps.push("first");
+      receiver = receiver.childForFieldName("receiver");
+    }
+    if (!receiver) return null;
+    const proof = receiver.type === "array" ? `literal Array at ${ctx.rel}:${receiver.startPosition.row + 1}`
+      : method ? rubyArrayParameterEvidence(receiver, method, ctx) : null;
+    if (!proof) return null;
+    evidence.push(proof);
+    steps.push("map");
+  }
+  return { steps: [...new Set(steps)], evidence: [...new Set(evidence)] };
+}
+
+/** Only a literal construction or an existing local/ivar can carry an injection.
+ * A reader with the same name, splat, block capture or arbitrary factory cannot. */
+function rubyBindingValue(node: Parser.SyntaxNode | null, ctx: WalkCtx, allowMapReceiver = false): RubyBindingValue | null {
+  if (!node || ctx.rubySelfKind === "unknown") return null;
+  if (node.type === "instance_variable" || (node.type === "identifier" && rubyIsVar(node, ctx))) {
+    if (!ctx.bindings.hasSingleRubyWrite(rubyScopeKey(node.text, ctx.scope, ctx.rubyClassScope, ctx.rubySelfKind), node.text)) return null;
+    if (!rubyBindingReadAllowed(node, node.type === "identifier")) return null;
+    const blocks = rubyMapBlockEvidence(node, ctx);
+    if (blocks === null || (blocks.steps.length && !allowMapReceiver)) return null;
+    return { binding: rubyBindingKey(node.text, ctx) };
+  }
+  if (node.type !== "call" || node.childForFieldName("method")?.text !== "new") return null;
+  // A constructor block can install singleton methods or otherwise replace the
+  // receiver's dispatch. A class name alone cannot certify that modified object.
+  if (rubyConstructionHasBlock(node)) return null;
+  const recv = node.childForFieldName("receiver");
+  const constant = recv ? rubyConstPath(recv) : null;
+  return constant ? { constant, file: ctx.rel, nesting: [...ctx.rubyNesting] } : null;
+}
+
+function rubyKeywordArguments(node: Parser.SyntaxNode, ctx: WalkCtx): Record<string, RubyBindingValue | null> | null {
+  if (node.childForFieldName("method")?.text === "new" && rubyConstructionHasBlock(node)) return null;
+  const result: Record<string, RubyBindingValue | null> = Object.create(null);
+  for (const arg of node.childForFieldName("arguments")?.namedChildren ?? []) {
+    if (["hash_splat_argument", "forward_argument", "splat_argument"].includes(arg.type)) return null;
+    if (arg.type !== "pair") continue;
+    const key = arg.childForFieldName("key");
+    if (key?.type !== "hash_key_symbol" || Object.hasOwn(result, key.text)) return null;
+    const value = arg.childForFieldName("value");
+    result[key.text] = value ? rubyBindingValue(value, ctx)
+      : rubyBindingReadAllowed(key, true) && ctx.bindings.hasSingleRubyWrite(rubyScopeKey(key.text, ctx.scope, ctx.rubyClassScope, ctx.rubySelfKind), key.text) && ctx.bindings.isRubyVar(rubyScopeKey(key.text, ctx.scope, ctx.rubyClassScope, ctx.rubySelfKind), key.text, key.startIndex)
+        ? { binding: rubyBindingKey(key.text, ctx) } : null;
+  }
+  return result;
 }
 
 const RUBY_MIXIN_KEYWORDS = new Set(["include", "extend", "prepend"] as const);
@@ -2829,20 +3093,20 @@ const RUBY_MIXIN_KEYWORDS = new Set(["include", "extend", "prepend"] as const);
  */
 function rubyMixinTargets(
   node: Parser.SyntaxNode,
-): { keyword: "include" | "extend" | "prepend"; targets: string[] } | null {
+): { keyword: "include" | "extend" | "prepend"; targets: string[]; unknown: boolean } | null {
   const methodNode = node.childForFieldName("method");
   if (methodNode?.type !== "identifier") return null;
   const keyword = methodNode.text as "include" | "extend" | "prepend";
   if (!RUBY_MIXIN_KEYWORDS.has(keyword)) return null;
   if (node.childForFieldName("receiver")) return null;
   const args = node.childForFieldName("arguments");
-  // `include ActiveSupport::Concern` is as common as `include Comparable`, and M0
-  // matched only the bare form. Anything whose head is not a constant
-  // (`include Dry::Monads[:result]`, an index call) still yields nothing.
-  const targets = (args?.namedChildren ?? [])
-    .map((c) => rubyConstPath(c))
-    .filter((p): p is string => p !== null);
-  return targets.length > 0 ? { keyword, targets } : null;
+  // A computed argument can install methods or inclusion hooks just as a named
+  // module can. Dropping it made workflow resolution mistake unknown ancestry
+  // for an empty method set, including in mixed `include Known, factory()` calls.
+  const paths = (args?.namedChildren ?? []).map(c => rubyConstPath(c));
+  const targets = paths.filter((p): p is string => p !== null);
+  const unknown = paths.some(p => p === null);
+  return paths.length > 0 ? { keyword, targets, unknown } : null;
 }
 
 interface RubySynthesizedMethod {
@@ -3411,7 +3675,7 @@ function rubyAssociationTarget(
  * association resolves to `Admin::User`, and M3's lexical lookup answered `::User`.
  */
 function rubyAssocNesting(ctx: WalkCtx): string[] {
-  const own = ctx.rubyNesting[0];
+  const own = ctx.rubyOwner;
   if (!own) return [...ctx.rubyNesting];
   const segs = own.split("::");
   const out: string[] = [];
@@ -3457,6 +3721,27 @@ function rubyMacroEdges(node: Parser.SyntaxNode, ctx: WalkCtx, classId: string):
   const syms = rubySymbolArgs(args);
   const out: RawEdge[] = [];
 
+  if (macro === "routing") {
+    for (const pair of args?.namedChildren ?? []) {
+      if (pair.type !== "pair") continue;
+      const value = pair.childForFieldName("value");
+      // Ruby symbols/strings only; interpolation and runtime-selected mailboxes
+      // do not name a statically verifiable processing endpoint.
+      const name = value?.type === "simple_symbol" ? value.text.slice(1)
+        : value?.type === "string" && value.namedChildren.length === 1 && value.namedChildren[0].type === "string_content" ? value.namedChildren[0].text : null;
+      if (!name || !/^[a-z][a-z0-9_]*(?:\/[a-z][a-z0-9_]*)*$/.test(name)) continue;
+      const target = name.split("/").map(part => camelize(part, ctx.rubyRails!.acronyms)).join("::") + "Mailbox";
+      out.push({ source: classId, relation: "dispatches", name: target, file: ctx.rel,
+        rubyOwnerFqn: ctx.rubyOwner, rubyMailbox: "routing" });
+    }
+    return out;
+  }
+  if (macro === "before_processing" || macro === "after_processing" || macro === "around_processing") {
+    for (const sym of syms) out.push({ source: classId, relation: "dispatches", name: sym, file: ctx.rel,
+      rubyOwnerFqn: ctx.rubyOwner, rubyMailbox: macro });
+    return out;
+  }
+
   if (AR_ASSOCIATIONS.has(macro) && syms[0]) {
     const target = rubyAssociationTarget(macro, syms[0], args, ctx);
     if (target) {
@@ -3482,7 +3767,7 @@ function rubyMacroEdges(node: Parser.SyntaxNode, ctx: WalkCtx, classId: string):
       out.push({
         source: classId, relation: "calls", name: sym, file: ctx.rel,
         viaMember: true, recvType: ctx.enclosingClass!,
-        ...(ctx.rubyNesting[0] ? { rubyOwnerFqn: ctx.rubyNesting[0] } : {}),
+        ...(ctx.rubyOwner ? { rubyOwnerFqn: ctx.rubyOwner } : {}),
         ...(ctx.rubyIncludedBlock ? { viaConcern: true } : {}),
       });
     }
@@ -3502,7 +3787,7 @@ function rubyMacroEdges(node: Parser.SyntaxNode, ctx: WalkCtx, classId: string):
         source: classId, relation: "references", name: sym, file: ctx.rel,
         recvType: ctx.enclosingClass!,
         railsHelperExport: true,
-        ...(ctx.rubyNesting[0] ? { rubyOwnerFqn: ctx.rubyNesting[0] } : {}),
+        ...(ctx.rubyOwner ? { rubyOwnerFqn: ctx.rubyOwner } : {}),
         ...(ctx.rubyIncludedBlock ? { viaConcern: true } : {}),
       });
     }
@@ -3535,7 +3820,7 @@ function rubyMacroEdges(node: Parser.SyntaxNode, ctx: WalkCtx, classId: string):
       out.push({
         source: classId, relation: "references", name: sym, file: ctx.rel,
         recvType: ctx.enclosingClass!,
-        ...(ctx.rubyNesting[0] ? { rubyOwnerFqn: ctx.rubyNesting[0] } : {}),
+        ...(ctx.rubyOwner ? { rubyOwnerFqn: ctx.rubyOwner } : {}),
         ...(ctx.rubyIncludedBlock ? { viaConcern: true } : {}),
       });
     }
@@ -3568,7 +3853,7 @@ function rubyDelegateForwards(
   const methodNode = node.childForFieldName("method");
   if (methodNode?.type !== "identifier" || methodNode.text !== "delegate") return [];
   if (node.childForFieldName("receiver")) return [];
-  const own = ctx.rubyNesting[0];
+  const own = ctx.rubyOwner;
   if (!own) return [];
   const args = node.childForFieldName("arguments");
   const to = rubyMacroName(args, "to");
@@ -4277,6 +4562,9 @@ function heritageEdges(node: Parser.SyntaxNode, classId: string, ctx: WalkCtx): 
     return edges;
   }
   if (ctx.lang === "ruby") {
+    const factory = rubyNamedClassFactory(node);
+    if (factory) return [{ source: classId, relation: "extends", name: factory.parent,
+      file: ctx.rel, nesting: [...ctx.rubyNesting], rubyHeritage: "superclass", rubyClassFactory: true }];
     const superclass = node.childForFieldName("superclass");
     // `class C < D::E` — M0 required a plain `constant` here, so every namespaced
     // parent emitted nothing at all. The name is kept as written and carries the

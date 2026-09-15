@@ -28,10 +28,10 @@ const KINDS = new Set<string>([
   "type", "enum", "struct", "module", "constant", "variable",
 ]);
 const RELATIONS = new Set<string>([
-  "contains", "calls", "imports", "references", "implements", "extends", "renders",
+  "contains", "calls", "imports", "references", "implements", "extends", "renders", "enqueues", "dispatches",
 ]);
 const CONFIDENCE = new Set<string>([
-  "lsp_resolved", "lsp_dispatch", "extracted", "type_bound", "convention", "inferred",
+  "lsp_resolved", "lsp_dispatch", "extracted", "type_bound", "ruby_dispatch", "ruby_injection", "convention", "inferred",
 ]);
 // Relations whose target may be a deliberately-unresolved external string rather
 // than an in-repo node id: an import's module specifier, a heritage clause naming

@@ -20,4 +20,6 @@ export const WALK_RELATIONS: ReadonlySet<Relation> = new Set<Relation>([
   // A controller action reaching its template is a real dependency: renaming the
   // view breaks the action, and "what does this action touch?" must say so.
   "renders",
+  "enqueues",
+  "dispatches",
 ]);

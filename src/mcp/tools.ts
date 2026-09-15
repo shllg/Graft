@@ -10,7 +10,7 @@ import { loadGraphCached } from '../graph/load.js';
 import { ensureFreshChildren, ensureFreshGraph, refreshNote } from '../graph/refresh.js';
 import { contextDirFor } from '../context/node-file.js';
 import { resolveSymbol, edgeWalk, type Direction, type EdgeHit } from '../graph/traverse.js';
-import { callersSavings, headerOf, hitLine, looseNoteFor } from '../graph/traverse-cli.js';
+import { callersSavings, headerOf, hitLine, looseNoteFor, jobEntrypointHint } from '../graph/traverse-cli.js';
 import { withSavings, setInputRate } from '../context/savings.js';
 import { sessionInputRate } from '../claude/session-metrics.js';
 import { grepGraph } from '../search/grep.js';
@@ -24,7 +24,7 @@ import {
   federateMap,
   readWorkspace,
 } from '../graph/workspace.js';
-import type { NodeV1 } from '../graph/types.js';
+import type { GraphV1, NodeV1 } from '../graph/types.js';
 import { canonicalToolName } from './tool-names.js';
 
 export interface ToolDef {
@@ -81,7 +81,7 @@ export const TOOLS: ToolDef[] = [
   {
     name: 'graft_trace_calls',
     description:
-      'Structural edges for a symbol, over call/reference/import/implements/extends ($0, no LLM). Defaults to direct callers (who depends on it). Set direction:"out" for callees (what it calls); set depth>1 (or depth:"all" for the full closure) to walk transitively for the full blast radius — every source that breaks if it changes. Run before a multi-file refactor to find ALL affected files.',
+      'Structural edges for a symbol, over call/reference/import/implements/extends plus explicitly labelled enqueues (async) and dispatches (conditional potential targets). Defaults to direct callers. Set direction:"out" for dependencies; set depth>1 (or depth:"all") for a transitive walk. These indexed relationships do not prove complete runtime behavior.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -134,11 +134,14 @@ function renderMatches(
   showDepth: boolean,
   matches: NodeV1[],
   hitsFor: (n: NodeV1) => EdgeHit[],
+  graph: GraphV1,
 ): string {
   return matches
     .map((m) => {
       const hits = hitsFor(m);
       const lines = [headerOf(m)];
+      const hint = jobEntrypointHint(graph, m);
+      if (hint) lines.push(hint);
       if (hits.length === 0) lines.push(looseNoteFor(direction, m.name, matches.length));
       else for (const h of hits) lines.push(hitLine(direction, h, showDepth));
       return lines.join('\n');
@@ -299,7 +302,7 @@ async function callSingleTool(
               : 1;
         const results = matches.map((m) => ({ symbol: m, hits: edgeWalk(w, m, direction, depth) }));
         const byId = new Map(results.map((r) => [r.symbol.id, r.hits]));
-        const body = renderMatches(direction, depth > 1, matches, (m) => byId.get(m.id) ?? []);
+        const body = renderMatches(direction, depth > 1, matches, (m) => byId.get(m.id) ?? [], w);
         const text = withSavings(body, callersSavings(w, results));
         return { text, isError: false };
       }

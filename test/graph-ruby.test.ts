@@ -149,7 +149,7 @@ end
   }
 });
 
-test("ruby Phase 1: a bare super() with no explicit callee emits no call edge", async () => {
+test("ruby: super() resolves the next implementation in the superclass chain", async () => {
   const src = `
 class Animal
   def initialize(name); end
@@ -164,8 +164,8 @@ end
   const { dir, graph } = await buildAndRead({ "dog.rb": src });
   try {
     assert.equal(
-      graph.edges.some((e) => e.relation === "calls" && e.source === "dog.rb#Dog.initialize"),
-      false,
+      graph.edges.some((e) => e.relation === "calls" && e.source === "dog.rb#Dog.initialize" && e.target === "dog.rb#Animal.initialize"),
+      true,
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -204,4 +204,88 @@ end
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("ruby: definition metadata uses whole spans and declaration signatures", () => {
+  const src = `class EmptyClass
+end
+module EmptyModule
+end
+class Host
+  def ordinary(value)
+    value
+  end
+  def self.singleton(value)
+    value
+  end
+  def empty
+  end
+  def self.empty_singleton
+  end
+  def endless(value) = value
+  def self.endless_singleton(value) = value
+end
+`;
+  const { nodes } = extractFile("definitions.rb", src, "ruby");
+  const byName = (name: string) => nodes.find((node) => node.name === name);
+
+  assert.deepEqual(
+    ["EmptyClass", "EmptyModule", "Host", "ordinary", "singleton", "empty", "empty_singleton", "endless", "endless_singleton"].map((name) => [
+      name,
+      byName(name)?.span,
+      byName(name)?.signature,
+    ]),
+    [
+      ["EmptyClass", "L1-L2", "class EmptyClass"],
+      ["EmptyModule", "L3-L4", "module EmptyModule"],
+      ["Host", "L5-L18", "class Host"],
+      ["ordinary", "L6-L8", "def ordinary(value)"],
+      ["singleton", "L9-L11", "def self.singleton(value)"],
+      ["empty", "L12-L13", "def empty"],
+      ["empty_singleton", "L14-L15", "def self.empty_singleton"],
+      ["endless", "L16-L16", "def endless(value)"],
+      ["endless_singleton", "L17-L17", "def self.endless_singleton(value)"],
+    ],
+  );
+});
+
+test("ruby: signature-only definition edits change the definition hash", () => {
+  const first = extractFile("signature.rb", "def renamed(first)\n  :stable\nend\n", "ruby").nodes.find((node) => node.name === "renamed");
+  const second = extractFile("signature.rb", "def renamed(second)\n  :stable\nend\n", "ruby").nodes.find((node) => node.name === "renamed");
+
+  assert.equal(first?.signature, "def renamed(first)");
+  assert.equal(second?.signature, "def renamed(second)");
+  assert.notEqual(first?.body_hash, second?.body_hash);
+});
+
+test("ruby: comment-only and semicolon-empty definitions stop at their syntax headers", () => {
+  const src = `class CommentOnly
+  # class note
+end
+module Semi; end
+class Parent < Base; end
+def comment_only(value)
+  # method note
+end
+def semicolon_empty; end
+def self.singleton_comment(value)
+  # singleton note
+end
+def self.singleton_semicolon; end
+`;
+  const { nodes } = extractFile("empty-definitions.rb", src, "ruby");
+  const byName = (name: string) => nodes.find((node) => node.name === name);
+
+  assert.deepEqual(
+    ["CommentOnly", "Semi", "Parent", "comment_only", "semicolon_empty", "singleton_comment", "singleton_semicolon"].map((name) => [name, byName(name)?.signature]),
+    [
+      ["CommentOnly", "class CommentOnly"],
+      ["Semi", "module Semi"],
+      ["Parent", "class Parent < Base"],
+      ["comment_only", "def comment_only(value)"],
+      ["semicolon_empty", "def semicolon_empty"],
+      ["singleton_comment", "def self.singleton_comment(value)"],
+      ["singleton_semicolon", "def self.singleton_semicolon"],
+    ],
+  );
 });

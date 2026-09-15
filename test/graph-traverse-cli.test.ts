@@ -9,10 +9,11 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { callTool } from '../src/mcp/tools.js';
 
 function builtRepo(): string {
   const d = mkdtempSync(join(tmpdir(), 'graft-traversecli-'));
@@ -214,3 +215,128 @@ test('graft callers: quotes the call site, and only where it is the right line',
   const json = JSON.parse(runCli(['callers', 'add', d, '--json']).stdout);
   assert.ok(!JSON.stringify(json).includes('return add(a, -b)'));
 });
+
+test('CLI and MCP workflow traces retain guards and receiver evidence while plain calls stay plain', async () => {
+  const d = builtRepo(), file = join(d, 'graft/.graph/wiring.json');
+  const graph = JSON.parse(readFileSync(file, 'utf8'));
+  const enqueue = graph.edges.find((edge: { source: string; relation: string }) => edge.source === 'src/math.ts#compute' && edge.relation === 'calls');
+  enqueue.relation = 'enqueues';
+  enqueue.confidence = 'convention';
+  enqueue.via = 'GoodJob 4.19.2 concurrency/labels guards may abort or retry';
+  graph.edges.push({ source: 'src/math.ts#compute', target: 'src/math.ts#add', relation: 'dispatches', confidence: 'ruby_dispatch', via: 'Ruby self.run_guards: possible receiver EmailRouteService (known receivers only)' });
+  graph.meta.edgeCount = graph.edges.length;
+  writeFileSync(file, JSON.stringify(graph));
+
+  for (const depth of [1, 'all'] as const) {
+    const cli = runCli(['callers', 'compute', d, '--direction', 'out', '--depth', String(depth), '--no-refresh']);
+    const mcp = await callTool(d, 'graft_trace_calls', { symbol: 'compute', direction: 'out', depth });
+    assert.equal(cli.status, 0);
+    assert.equal(mcp.isError, false);
+    for (const text of [cli.stdout, mcp.text]) {
+      assert.match(text, /enqueues → sub .*\[convention; GoodJob 4\.19\.2 concurrency\/labels guards may abort or retry\]/);
+      assert.match(text, /dispatches → add .*\[ruby_dispatch; Ruby self\.run_guards: possible receiver EmailRouteService \(known receivers only\)\]/);
+    }
+  }
+  const plainCli = runCli(['callers', 'sub', d, '--direction', 'out', '--no-refresh']);
+  const plainMcp = await callTool(d, 'graft_trace_calls', { symbol: 'sub', direction: 'out' });
+  for (const text of [plainCli.stdout, plainMcp.text]) {
+    const line = text.split('\n').find(line => line.includes('calls → add'));
+    assert.match(line!, /^  calls → add \(src\/math\.ts:L\d+-L\d+\)$/);
+  }
+});
+
+for (const jobPath of ['jobs.rb', "jobs 'quoted' $GRAFT_HINT_QUOTE_TEST `printf expanded`.rb"]) {
+test(`ActiveJob class navigation follows the exact inherited perform locator in ${jobPath}`, async () => {
+  const d = mkdtempSync(join(tmpdir(), 'graft-job-navigation-'));
+  writeFileSync(join(d, 'Gemfile'), 'gem "rails"');
+  mkdirSync(join(d, 'config'));
+  writeFileSync(join(d, 'config/application.rb'), 'require "rails/all"');
+  writeFileSync(join(d, jobPath), `class ApplicationJob < ActiveJob::Base; end
+module Mail
+ class BaseJob < ApplicationJob; def perform; end; end
+ class DeliveryJob < BaseJob; end
+end
+module Other
+ class DeliveryJob; def perform; end; end
+end
+class Runner
+ def queue; Mail::DeliveryJob.perform_later; end
+end`);
+  execFileSync(process.execPath, ['--import', 'tsx', 'src/cli.ts', 'build', d], { stdio: 'pipe' });
+  const cli = runCli(['callers', 'Mail.DeliveryJob', d, '--no-refresh']);
+  const mcp = await callTool(d, 'graft_trace_calls', { symbol: 'Mail.DeliveryJob' });
+  const json = JSON.parse(runCli(['callers', 'Mail.DeliveryJob', d, '--json', '--no-refresh']).stdout);
+  for (const text of [cli.stdout, mcp.text, json.matches[0].hint]) {
+    const command = text.match(/ActiveJob entrypoint: (.+) — inspect perform and its enqueuers/)?.[1];
+    assert.ok(command, text);
+    // Let a real shell decode the emitted command, but capture its arguments
+    // instead of invoking an installed binary. The filename's substitutions
+    // are harmless witnesses that quoting preserves literal source paths.
+    const args = execFileSync('/bin/sh', ['-c', String.raw`graft() { printf '%s\0' "$@"; }; ` + command], {
+      encoding: 'utf8', env: { ...process.env, GRAFT_HINT_QUOTE_TEST: 'expanded' },
+    }).split('\0').slice(0, -1);
+    const followed = runCli([...args, d, '--json', '--no-refresh']);
+    assert.equal(followed.status, 0, followed.stderr);
+    const targets = JSON.parse(followed.stdout).matches;
+    assert.deepEqual(targets.map((match: { symbol: { id: string } }) => match.symbol.id), [`${jobPath}#Mail.BaseJob.perform`]);
+    assert.deepEqual(args, ['callers', 'Mail.BaseJob.perform', '--in', jobPath]);
+    assert.ok(targets[0].hits.some((hit: { relation: string; name: string }) => hit.relation === 'enqueues' && hit.name === 'queue'));
+  }
+  for (const text of [cli.stdout, mcp.text]) {
+    assert.match(text, /DeliveryJob · class/);
+  }
+  const plain = runCli(['callers', 'Other.DeliveryJob', d, '--no-refresh']);
+  assert.doesNotMatch(plain.stdout, /ActiveJob entrypoint/);
+  const ambiguous = runCli(['callers', 'DeliveryJob', d, '--no-refresh']);
+  assert.equal((ambiguous.stdout.match(/ActiveJob entrypoint/g) ?? []).length, 1);
+  assert.ok(json.matches[0].hits.some((hit: { relation: string }) => hit.relation === 'references'));
+});
+}
+
+for (const fixture of [
+  {
+    name: 'class and instance perform methods', query: 'DeliveryJob',
+    target: 'jobs.rb#DeliveryJob.perform~2', reason: /exact callers selection unsupported/,
+    source: `class ApplicationJob < ActiveJob::Base; end
+class DeliveryJob < ApplicationJob
+ def self.perform; end
+ def perform; end
+end
+class Runner; def queue; DeliveryJob.perform_later; end; end`,
+  },
+  {
+    name: 'same-file nested namespace suffix', query: 'Mail.DeliveryJob',
+    target: 'jobs.rb#Mail.BaseJob.perform', reason: /ambiguous callers selection \(2 matches\)/,
+    source: `class ApplicationJob < ActiveJob::Base; end
+module Mail; class BaseJob < ApplicationJob; def perform; end; end; class DeliveryJob < BaseJob; end; end
+module Other; module Mail; class BaseJob; def perform; end; end; end; end
+class Runner; def queue; Mail::DeliveryJob.perform_later; end; end`,
+  },
+]) {
+  test(`ActiveJob navigation retains a source locator when selection cannot distinguish ${fixture.name}`, async () => {
+    const d = mkdtempSync(join(tmpdir(), 'graft-job-navigation-fallback-'));
+    writeFileSync(join(d, 'Gemfile'), 'gem "rails"');
+    mkdirSync(join(d, 'config'));
+    writeFileSync(join(d, 'config/application.rb'), 'require "rails/all"');
+    writeFileSync(join(d, 'jobs.rb'), fixture.source);
+    execFileSync(process.execPath, ['--import', 'tsx', 'src/cli.ts', 'build', d], { stdio: 'pipe' });
+    const graph = JSON.parse(readFileSync(join(d, 'graft/.graph/wiring.json'), 'utf8'));
+    assert.deepEqual(graph.edges.filter((edge: { relation: string }) => edge.relation === 'enqueues')
+      .map((edge: { target: string }) => edge.target), [fixture.target]);
+    const target = graph.nodes.find((node: { id: string }) => node.id === fixture.target);
+    assert.ok(target);
+    const cli = runCli(['callers', fixture.query, d, '--no-refresh']);
+    assert.equal(cli.status, 0, cli.stderr);
+    const mcp = await callTool(d, 'graft_trace_calls', { symbol: fixture.query });
+    const json = JSON.parse(runCli(['callers', fixture.query, d, '--json', '--no-refresh']).stdout);
+    assert.equal(json.matches.length, 1);
+    for (const text of [cli.stdout, mcp.text, json.matches[0].hint]) {
+      const hint = text.split('\n').find((line: string) => line.includes('ActiveJob entrypoint:'));
+      assert.ok(hint, text);
+      assert.doesNotMatch(hint, /graft callers/);
+      assert.ok(hint.includes(target.id), hint);
+      assert.ok(hint.includes(`${target.path}:${target.span}`), hint);
+      assert.match(hint, fixture.reason);
+    }
+  });
+}

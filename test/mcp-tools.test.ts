@@ -91,6 +91,7 @@ test('TOOLS lists the six tools with schemas', async () => {
   const props = (callers.inputSchema as { properties: Record<string, unknown> }).properties;
   assert.ok('direction' in props, 'graft_trace_calls schema should document `direction`');
   assert.ok('depth' in props, 'graft_trace_calls schema should document `depth`');
+  assert.match(callers.description, /conditional|async/i, 'trace guidance names relationships that are not unconditional runtime calls');
 });
 
 test('graft_find_code returns ranked hits for a built repo', async () => {

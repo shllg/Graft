@@ -14,6 +14,8 @@
  * `SKILL.md` tells the model to trust the answer and act.
  */
 import { test } from "node:test";
+import { extractFile } from "../src/graph/extract.js";
+import { resolveEdges } from "../src/graph/resolve.js";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -582,4 +584,377 @@ test("ruby constants: a qualified tail resolves through the head's superclass", 
       assert.deepEqual(refs(graph, "t.rb#T.go"), ["base.rb#Schemas.BaseSchema.ValidationError"]);
     },
   );
+});
+
+// These fixtures resolve in memory: factory validation needs the repository's
+// constants, but none of its filesystem/autoload conventions.
+function factoryGraph(files: Record<string, string>): GraphV1 {
+  const extracted = Object.entries(files).map(([path, source]) => extractFile(path, source, "ruby"));
+  const nodes = extracted.flatMap(result => result.nodes);
+  const edges = resolveEdges(nodes, extracted.flatMap(result => result.rawEdges));
+  return { nodes, edges } as GraphV1;
+}
+const factoryCalls = (graph: GraphV1, source: string) => graph.edges
+  .filter(edge => edge.source === source && edge.relation === "calls").map(edge => edge.target).sort();
+
+test("ruby class factories: named subclasses own methods and reach inherited call", () => {
+  const graph = factoryGraph({ "a.rb": `class Base
+  def call; perform; end
+end
+class BaseTest
+  RaisingTool = Class.new(Base) do
+    def perform; raise "failed"; end
+  end
+  def run; RaisingTool.new.call; end
+end` });
+  assert.ok(graph.nodes.some(node => node.id === "a.rb#BaseTest.RaisingTool" && node.kind === "class"));
+  assert.ok(graph.nodes.some(node => node.id === "a.rb#BaseTest.RaisingTool.perform" && node.owner === "RaisingTool"));
+  assert.ok(!graph.nodes.some(node => node.id === "a.rb#BaseTest.perform"));
+  assert.ok(graph.edges.some(edge => edge.source === "a.rb#BaseTest.RaisingTool" && edge.relation === "extends" && edge.target === "a.rb#Base"));
+  assert.deepEqual(factoryCalls(graph, "a.rb#BaseTest.run"), ["a.rb#Base.call"]);
+});
+
+test("ruby class factories: error attributes and initializer belong to the error", () => {
+  const graph = factoryGraph({ "a.rb": `class CalendarProvider
+  Error = Class.new(StandardError) do
+    attr_reader :reason
+    def initialize(reason); @reason = reason; end
+    def self.label; end
+  end
+  def initialize; end
+  def run; Error.new("failure").reason; Error.label; end
+end` });
+  assert.equal(graph.nodes.filter(node => node.id.startsWith("a.rb#CalendarProvider.initialize")).length, 1);
+  for (const name of ["reason", "initialize", "label"]) assert.ok(graph.nodes.some(node => node.id === `a.rb#CalendarProvider.Error.${name}` && node.owner === "Error"));
+  assert.deepEqual(factoryCalls(graph, "a.rb#CalendarProvider.run"), ["a.rb#CalendarProvider.Error.label", "a.rb#CalendarProvider.Error.reason"]);
+});
+
+test("ruby class factories: no-block subclasses retain static lexical superclass lookup", () => {
+  const graph = factoryGraph({ "a.rb": `class Base; def outer; end; end
+module Suite
+  class Base; def call; end; end
+  Child = Class.new(Base)
+  def run; Child.new.call; end
+end` });
+  assert.deepEqual(factoryCalls(graph, "a.rb#Suite.run"), ["a.rb#Suite.Base.call"]);
+  assert.ok(graph.edges.some(edge => edge.source === "a.rb#Suite.Child" && edge.relation === "extends" && edge.target === "a.rb#Suite.Base"));
+});
+
+test("ruby class factories: a block retains its lexical cref while self uses the new owner", () => {
+  const graph = factoryGraph({ "a.rb": `class Base
+  class Helper; def wrong; end; end
+end
+module Suite
+  class Helper; def call; end; end
+  Child = Class.new(Base) do
+    def helper; Helper.new; end
+    def run; helper.call; end
+  end
+end` });
+  assert.deepEqual(refs(graph, "a.rb#Suite.Child.helper"), ["a.rb#Suite.Helper"]);
+  assert.deepEqual(factoryCalls(graph, "a.rb#Suite.Child.run"), ["a.rb#Suite.Child.helper", "a.rb#Suite.Helper.call"]);
+});
+
+test("ruby class factories: instance and class ivars remain isolated from the outer class", () => {
+  const graph = factoryGraph({ "a.rb": `class OuterValue; def call; end; end
+class InnerValue; def call; end; end
+class Base; end
+class Outer
+  def initialize; @value = OuterValue.new; end
+  Child = Class.new(Base) do
+    def initialize; @value = InnerValue.new; end
+    def run; @value.call; end
+    def self.run; @value.call; end
+  end
+  def run; @value.call; end
+end` });
+  assert.deepEqual(factoryCalls(graph, "a.rb#Outer.run"), ["a.rb#OuterValue.call"]);
+  assert.deepEqual(factoryCalls(graph, "a.rb#Outer.Child.run"), ["a.rb#InnerValue.call"]);
+  assert.deepEqual(factoryCalls(graph, "a.rb#Outer.Child.run~2"), []);
+});
+
+for (const [label, extra] of Object.entries({
+  "shadowed Class": `Class = Object.new`,
+  "reopened Class": `class Class; def self.new(parent); Object.new; end; end`,
+  "redefined Class.new": `def Class.new(parent); Object.new; end`,
+  "modified singleton factory": `Class.define_singleton_method(:new) { |parent| Object.new }`,
+  "modified singleton class": `Class.singleton_class.prepend(Unknown)`,
+  "reassigned target": `Suite::Child = Object.new`,
+  "conflicting target": `module Suite; class Child; def run; end; end; end`,
+  "ambiguous factory target": `module Suite; Child = Class.new(Base); end`,
+})) test(`ruby class factories: ${label} declines factory edges across files`, () => {
+  const graph = factoryGraph({ "a.rb": `class Base; def call; end; end
+module Suite
+  Child = Class.new(Base) do
+    attr_reader :value
+    def run; call; end
+  end
+  def use; Child.new.call; Child.new.run; end
+end`, "change.rb": extra });
+  assert.deepEqual(factoryCalls(graph, "a.rb#Suite.use"), []);
+  assert.deepEqual(factoryCalls(graph, "a.rb#Suite.Child.run"), []);
+  assert.ok(!graph.edges.some(edge => edge.source.startsWith("a.rb#Suite.Child") || edge.target.startsWith("a.rb#Suite.Child")), "invalid factory symbols have no incoming or outgoing relation");
+  assert.ok(!graph.nodes.some(node => ["a.rb#Suite.run", "a.rb#Suite.value"].includes(node.id)));
+});
+
+for (const factory of ["Class.new(parent)", "factory(Base)", "Other.new(Base)", "Class.new(Base, option: true)"]) {
+  test(`ruby class factories: unknown ${factory} block never leaks ownership`, () => {
+    const graph = factoryGraph({ "a.rb": `class Base; end
+class Value; def call; end; end
+class Outer
+  Child = ${factory} do
+    attr_reader :value
+    def initialize; @value = Value.new; end
+    def run; end
+  end
+  def use; @value.call; end
+end` });
+    assert.ok(!graph.nodes.some(node => ["a.rb#Outer.initialize", "a.rb#Outer.run", "a.rb#Outer.value"].includes(node.id)));
+    assert.deepEqual(factoryCalls(graph, "a.rb#Outer.use"), []);
+  });
+}
+
+test("ruby class factories: parent reassignment and lexical Class shadows stop inheritance", () => {
+  for (const extra of ["Base = Object.new", "module Suite; Class = Object.new; end", "class Ancestor; Class = Object.new; end\nmodule Suite; include Ancestor; end"]) {
+    const graph = factoryGraph({ "a.rb": `class Base; def call; end; end
+module Suite
+  Child = Class.new(Base) do
+    def run; call; end
+  end
+  def use; Child.new.run; end
+end`, "change.rb": extra });
+    assert.deepEqual(factoryCalls(graph, "a.rb#Suite.use"), [], extra);
+    assert.ok(!graph.edges.some(edge => edge.relation !== "contains" && (edge.source.includes("Suite.Child") || edge.target.includes("Suite.Child"))), extra);
+  }
+});
+
+test("ruby class factories: nested declarations use the block's lexical namespace", () => {
+  const graph = factoryGraph({ "a.rb": `class Base; end
+module Suite
+  Child = Class.new(Base) do
+    class Helper; def call; end; end
+    Other = Class.new(Base) do
+      def call; end
+    end
+    def run; Helper.new.call; Other.new.call; end
+  end
+end` });
+  assert.ok(graph.nodes.some(node => node.id === "a.rb#Suite.Helper"));
+  assert.ok(graph.nodes.some(node => node.id === "a.rb#Suite.Other"));
+  assert.deepEqual(factoryCalls(graph, "a.rb#Suite.Child.run"), ["a.rb#Suite.Helper.call", "a.rb#Suite.Other.call"]);
+});
+
+test("ruby class factories: alias mutation and eigenclass redefinition stop the builtin", () => {
+  for (const extra of ["factory = Class; factory.define_singleton_method(:new) { |parent| Object.new }", "class << Class; def new(parent); Object.new; end; end"]) {
+    const graph = factoryGraph({ "a.rb": `class Base; def call; end; end
+Child = Class.new(Base) do
+  def run; call; end
+end
+def use; Child.new.run; end`, "change.rb": extra });
+    assert.deepEqual(factoryCalls(graph, "a.rb#use"), [], extra);
+    assert.ok(!graph.edges.some(edge => edge.relation !== "contains" && (edge.source.startsWith("a.rb#Child") || edge.target.startsWith("a.rb#Child"))), extra);
+  }
+});
+
+test("ruby class factories: constructor overrides cannot type new results as subclass instances", () => {
+  for (const change of ["def self.new; Object.new; end", ""]) {
+    const graph = factoryGraph({ "a.rb": `class Base
+  ${change ? "" : "def self.new; Object.new; end"}
+end
+Child = Class.new(Base) do
+  ${change}
+  def run; end
+end
+def use; Child.new.run; end` });
+    assert.deepEqual(factoryCalls(graph, "a.rb#use"), []);
+  }
+  const mutated = factoryGraph({ "a.rb": `class Base; end
+Child = Class.new(Base) do
+  def run; end
+end
+Child.define_singleton_method(:new) { Object.new }
+def use; Child.new.run; end` });
+  assert.deepEqual(factoryCalls(mutated, "a.rb#use"), []);
+});
+
+test("ruby class factories: inherited builtin factory overrides and send mutations decline", () => {
+  for (const change of ["class Module; def self.new(*); Object.new; end; end", "Class.send(:define_singleton_method, :new) { Object.new }"]) {
+    const graph = factoryGraph({ "a.rb": `class Base; end
+Child = Class.new(Base) do
+  def run; end
+end
+def use; Child.new.run; end`, "change.rb": change });
+    assert.deepEqual(factoryCalls(graph, "a.rb#use"), [], change);
+  }
+});
+
+test("ruby class factories: receiverless mutation in the block invalidates constructor inference", () => {
+  const graph = factoryGraph({ "a.rb": `class Base; end
+Child = Class.new(Base) do
+  define_singleton_method(:new) { Object.new }
+  def run; end
+end
+def use; Child.new.run; end` });
+  assert.deepEqual(factoryCalls(graph, "a.rb#use"), []);
+});
+
+test("ruby class factories: invalid blocks withdraw lexically owned dependent definitions", () => {
+  for (const mutation of ["def Class.new(parent); Object.new; end", ""]) {
+    const graph = factoryGraph({ "a.rb": `class Base; end
+${mutation}
+module Suite
+  Child = Class.new(Base) do
+    class Helper; def call; end; end
+    Other = Class.new(Base) do
+      def call; end
+    end
+  end
+  def use; Helper.new.call; Other.new.call; end
+end` });
+    assert.deepEqual(factoryCalls(graph, "a.rb#Suite.use"), mutation ? [] : ["a.rb#Suite.Helper.call", "a.rb#Suite.Other.call"]);
+    if (mutation) assert.ok(!graph.edges.some(edge => /#Suite\.(Helper|Other)/.test(edge.source) || /#Suite\.(Helper|Other)/.test(edge.target)));
+  }
+});
+
+test("ruby class factories: bounded local and constant aliases cannot hide factory mutation", () => {
+  for (const alias of [
+    "factory = Class; other = factory; other.define_singleton_method(:new) { |parent| Object.new }",
+    "Factory = Class; Factory.define_singleton_method(:new) { |parent| Object.new }",
+    "Factory = Class; Other = Factory; Other.define_singleton_method(:new) { |parent| Object.new }",
+  ]) {
+    const graph = factoryGraph({ "a.rb": `class Base; end
+Child = Class.new(Base) do
+  def run; end
+end
+def use; Child.new.run; end`, "mutation.rb": alias });
+    assert.deepEqual(factoryCalls(graph, "a.rb#use"), [], alias);
+  }
+  const graph = factoryGraph({ "a.rb": `class Base; end
+class Unrelated; end
+factory = Unrelated; other = factory; other.define_singleton_method(:label) { "label" }
+Child = Class.new(Base) do
+  def run; end
+end
+def use; Child.new.run; end` });
+  assert.deepEqual(factoryCalls(graph, "a.rb#use"), ["a.rb#Child.run"]);
+});
+
+test("ruby class factories: inherited hooks make newly created class behavior uncertain", () => {
+  for (const declaration of [
+    "def self.inherited(child); child.define_singleton_method(:new) { Object.new }; end",
+    "def inherited(child); end",
+  ]) {
+    const graph = factoryGraph({ "a.rb": `class Ancestor
+  ${declaration}
+end
+class Base < Ancestor; end
+Child = Class.new(Base) do
+  def run; end
+end
+def use; Child.new.run; end` });
+    assert.deepEqual(factoryCalls(graph, "a.rb#use"), declaration.startsWith("def self.") ? [] : ["a.rb#Child.run"]);
+  }
+});
+
+test("ruby class factories: unrelated instance mutations do not invalidate builtin class creation", () => {
+  const graph = factoryGraph({ "a.rb": `class Base; end
+class Value; end
+value = Value.new
+value.define_singleton_method(:label) { "label" }
+Child = Class.new(Base) do
+  def run; end
+end
+def use; Child.new.run; end` });
+  assert.deepEqual(factoryCalls(graph, "a.rb#use"), ["a.rb#Child.run"]);
+});
+
+test("ruby class factories: ordinary reflective instance calls do not imply Class mutation", () => {
+  const graph = factoryGraph({ "a.rb": `class Base; end
+class Value; end
+def reflect(object)
+  object.send(:label)
+  object.public_send(:label)
+end
+value = Value.new
+value.send(:label)
+Child = Class.new(Base) do
+  def run; end
+end
+def use; Child.new.run; end` });
+  assert.deepEqual(factoryCalls(graph, "a.rb#use"), ["a.rb#Child.run"]);
+});
+
+test("ruby class factories: competing alias writers retain possible Class exposure", () => {
+  const graph = factoryGraph({ "a.rb": `class Base; end
+factory = Class
+factory = Object.new
+other = factory
+other.define_singleton_method(:new) { Object.new }
+Child = Class.new(Base) do
+  def run; end
+end
+def use; Child.new.run; end` });
+  assert.deepEqual(factoryCalls(graph, "a.rb#use"), []);
+});
+
+test("ruby class factories: unresolved external namespace mutations are not builtin exposure", () => {
+  const graph = factoryGraph({ "a.rb": `module External; end
+External::Client.class_eval do
+  def label; end
+end
+class Base; end
+Child = Class.new(Base) do
+  def run; end
+end
+def use; Child.new.run; end` });
+  assert.deepEqual(factoryCalls(graph, "a.rb#use"), ["a.rb#Child.run"]);
+});
+
+test("ruby class factories: qualified alias assignments use the resolved namespace", () => {
+  for (const target of ["Class", "Unrelated"]) {
+    const graph = factoryGraph({ "a.rb": `module Holder; end
+class Unrelated; end
+module Suite
+  Holder::Factory = ${target}
+end
+Holder::Factory.define_singleton_method(:new) { |parent| Object.new }
+class Base; end
+Child = Class.new(Base) do
+  def run; end
+end
+def use; Child.new.run; end` });
+    assert.deepEqual(factoryCalls(graph, "a.rb#use"), target === "Class" ? [] : ["a.rb#Child.run"]);
+  }
+});
+
+test("ruby class factories: anonymous stub symbols remain inspectable without guessed callers", () => {
+  const graph = factoryGraph({ "spec.rb": `before do
+  stub_const("AiUsageLog", Class.new do
+    def self.create!(*args); end
+  end)
+end`, "app.rb": `class SomeModel; end
+class OtherModel; end
+def run
+  SomeModel.create!
+  OtherModel.create!
+  AiUsageLog.create!
+end` });
+  const stub = graph.nodes.find(node => node.id === "spec.rb#create!");
+  assert.ok(stub, "the existing anonymous stub symbol remains inspectable");
+  assert.equal(stub.receiver, "class");
+  assert.deepEqual(graph.edges.filter(edge => edge.target === stub.id && edge.relation === "calls"), []);
+  assert.deepEqual(factoryCalls(graph, "app.rb#run"), []);
+});
+
+test("ruby class factories: ordinary constructor blocks retain their lexical calls", () => {
+  const graph = factoryGraph({ "a.rb": `class Builder; end
+class Worker
+  def helper; end
+  def run
+    Builder.new do
+      helper
+    end
+  end
+end` });
+  assert.deepEqual(factoryCalls(graph, "a.rb#Worker.run"), ["a.rb#Worker.helper"]);
 });

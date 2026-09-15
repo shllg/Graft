@@ -28,6 +28,8 @@ import { extractorStamp, pruneSidecars, type ExtractEntry } from "./extract-cach
 import { listSourceStats } from "./source-files.js";
 import { RAILS_WITNESS_FILES } from "./zeitwerk.js";
 
+const RESOLVER_WITNESS_FILES = [...RAILS_WITNESS_FILES, "Gemfile.lock", "gems.locked"] as const;
+
 export const FINGERPRINT_PREFIX = "fingerprint";
 const FINGERPRINT_VERSION = 1;
 
@@ -98,7 +100,7 @@ export function writeFingerprint(
   // repo from a Rails app into a plain Ruby one — a one-line Gemfile edit — left the
   // probe reporting clean while every constant edge in the graph was now resolved by
   // rules that no longer apply. See RAILS_WITNESS_FILES.
-  if (root) for (const rel of RAILS_WITNESS_FILES) {
+  if (root) for (const rel of RESOLVER_WITNESS_FILES) {
     const print = witnessPrint(root, rel);
     if (print) files[rel] = print;
   }
@@ -199,7 +201,7 @@ export function probeDrift(root: string, outDir: string): Drift | null {
   // The witness files are not enumerated by `listSourceStats`, so they are stated
   // explicitly — in all three directions, since a Gemfile can appear as well as
   // change or vanish.
-  for (const rel of RAILS_WITNESS_FILES) {
+  for (const rel of RESOLVER_WITNESS_FILES) {
     seen.add(rel);
     const print = witnessPrint(root, rel);
     const recorded = fp.files[rel];
