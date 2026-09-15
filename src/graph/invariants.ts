@@ -28,10 +28,10 @@ const KINDS = new Set<string>([
   "type", "enum", "struct", "module", "constant", "variable",
 ]);
 const RELATIONS = new Set<string>([
-  "contains", "calls", "imports", "references", "implements", "extends", "renders", "enqueues", "dispatches",
+  "contains", "calls", "imports", "references", "implements", "extends", "renders", "serves", "enqueues", "dispatches",
 ]);
 const CONFIDENCE = new Set<string>([
-  "lsp_resolved", "lsp_dispatch", "extracted", "type_bound", "ruby_dispatch", "ruby_injection", "convention", "inferred",
+  "lsp_resolved", "lsp_dispatch", "extracted", "type_bound", "ruby_dispatch", "ruby_injection", "convention", "inferred", "extension",
 ]);
 // Relations whose target may be a deliberately-unresolved external string rather
 // than an in-repo node id: an import's module specifier, a heritage clause naming
@@ -66,6 +66,8 @@ export function checkGraphInvariants(graph: GraphV1): InvariantResult {
     const m = /^L(\d+)-L(\d+)$/.exec(n.span ?? "");
     if (!m) problems.push(`bad span '${n.span}': ${n.id}`);
     else if (Number(m[1]) > Number(m[2])) problems.push(`inverted span ${n.span}: ${n.id}`);
+    if (n.origin === "extension" && (!/^[a-f0-9]{64}$/.test(n.extension ?? "") || !/^[a-f0-9]{64}$/.test(n.extensionDigest ?? "")))
+      problems.push(`missing extension provenance: ${n.id}`);
   }
 
   let selfLoopCalls = 0;
@@ -73,8 +75,10 @@ export function checkGraphInvariants(graph: GraphV1): InvariantResult {
     if (!RELATIONS.has(e.relation)) problems.push(`bad relation '${e.relation}': ${e.source}`);
     if (!CONFIDENCE.has(e.confidence)) problems.push(`bad confidence '${e.confidence}': ${e.source} → ${e.target}`);
     if (!ids.has(e.source)) problems.push(`dangling source: ${e.source}`);
-    if (!ids.has(e.target) && !TARGET_MAY_BE_EXTERNAL.has(e.relation))
+    if (!ids.has(e.target) && (e.origin === "extension" || !TARGET_MAY_BE_EXTERNAL.has(e.relation)))
       problems.push(`dangling ${e.relation} target: ${e.source} → ${e.target}`);
+    if ((e.origin === "extension" || e.confidence === "extension") && (e.origin !== "extension" || e.confidence !== "extension" || !/^[a-f0-9]{64}$/.test(e.extension ?? "") || !/^[a-f0-9]{64}$/.test(e.extensionDigest ?? "")))
+      problems.push(`invalid extension provenance: ${e.source} → ${e.target}`);
     if (e.relation === "calls" && e.source === e.target) selfLoopCalls++;
   }
 

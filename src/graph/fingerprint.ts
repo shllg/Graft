@@ -7,6 +7,9 @@
  * with the last build's record get read and hashed, which is what keeps a `touch`
  * or a `git checkout` of identical bytes from triggering a pointless rebuild.
  *
+ * Approved extension snapshots are the exception: their readable data inputs
+ * are byte-hashed separately, including files outside the parsed source set.
+ *
  * Git supplies the visible file set (`tracked + untracked - ignored`) when
  * available, but drift is still measured against bytes in the working tree:
  * an uncommitted, staged, or committed edit to an indexed file looks the same.
@@ -29,6 +32,9 @@ import { listSourceStats } from "./source-files.js";
 import { RAILS_WITNESS_FILES } from "./zeitwerk.js";
 
 const RESOLVER_WITNESS_FILES = [...RAILS_WITNESS_FILES, "Gemfile.lock", "gems.locked"] as const;
+import { extensionExecutionStamp, extensionFingerprint, RUN_REASON_CODES, type ExtensionRun } from "./extensions.js";
+import { extensionInputFingerprint, extensionOutputExclusions } from "./extension-runtime.js";
+import { loadGraphCached } from "./load.js";
 
 export const FINGERPRINT_PREFIX = "fingerprint";
 const FINGERPRINT_VERSION = 1;
@@ -58,6 +64,60 @@ export interface Fingerprint {
    * — so the query-path freshness probe (which never sees a CLI flag) enumerates the
    * identical whitelisted set and excluded files are never phantom "added" drift. */
   onlyDirs?: string[];
+  /** Local grants and package integrity also determine the graph's edge set. */
+  extensions?: string;
+  /** Every complete host-captured source view, including failed executions.
+   * Incomplete captures have no contributed edges and are tracked in extensionBuild. */
+  extensionInputs?: string[];
+  extensionInputExclusions?: string[];
+  /** Source freshness does not certify execution: unavailable isolation still
+   * produces a current core graph, with no extension contribution. */
+  extensionBuild?: {
+    stamp: string;
+    attemptedAt: number;
+    runs: Array<Pick<ExtensionRun, "id" | "digest" | "status" | "reasonCode" | "inputFingerprint">>;
+  };
+}
+
+export interface ExtensionHealth {
+  ok: boolean;
+  issues: Array<{ id: string; reasonCode: string }>;
+  /** Earliest automatic retry; absent means a build/input/approval change is needed. */
+  retryAt?: number;
+}
+
+const EXTENSION_RETRY_MS = 60_000;
+const RETRYABLE_EXTENSION_REASONS = new Set(["isolation-unavailable", "timeout", "runtime-error", "source-limit", "context-too-large", "audit-error", "registry-error", "build-budget-exhausted", "validation-budget-exhausted"]);
+
+/** An empty input-stamp list used to make a skipped extension permanently look
+ * current. Keep execution health separate from source drift, with a disk-backed
+ * cooldown so separate CLI processes cannot rebuild on every failed query. */
+export function extensionHealth(fingerprint: Fingerprint | null): ExtensionHealth {
+  if (!fingerprint?.extensions && !fingerprint?.extensionBuild) return { ok: true, issues: [] };
+  const unknown = (): ExtensionHealth => ({ ok: false, issues: [{ id: "registry", reasonCode: "build-status-unknown" }], retryAt: 0 });
+  const build = fingerprint.extensionBuild;
+  if (!build || !Number.isSafeInteger(build.attemptedAt) || build.attemptedAt < 0
+    || !Array.isArray(build.runs) || build.runs.length > 8 || (!build.runs.length && fingerprint.extensions)) return unknown();
+  const ids = new Set<string>();
+  const issues: ExtensionHealth["issues"] = [];
+  for (const run of build.runs) {
+    if (!run || typeof run !== "object" || typeof run.id !== "string" || ids.has(run.id)
+      || !(run.id === "registry" ? run.digest === "" : /^[a-f0-9]{64}$/.test(run.id) && typeof run.digest === "string" && /^[a-f0-9]{64}$/.test(run.digest))
+      || !["ok", "failed", "skipped"].includes(run.status)
+      || (run.reasonCode !== undefined && !RUN_REASON_CODES.includes(run.reasonCode))
+      || (run.inputFingerprint !== undefined && (typeof run.inputFingerprint !== "string"
+        || !(run.inputFingerprint === "unavailable" || /^[a-f0-9]{64}$/.test(run.inputFingerprint))))) return unknown();
+    ids.add(run.id);
+    if (run.status !== "ok" || run.reasonCode) issues.push({ id: run.id, reasonCode: run.reasonCode ?? "legacy-failure" });
+  }
+  if (typeof build.stamp !== "string" || build.stamp !== extensionExecutionStamp(fingerprint.extensions ?? "", build.runs)) return unknown();
+  const retry = issues.some(issue => RETRYABLE_EXTENSION_REASONS.has(issue.reasonCode));
+  return { ok: issues.length === 0, issues, ...(retry ? { retryAt: build.attemptedAt + EXTENSION_RETRY_MS } : {}) };
+}
+
+export function extensionHealthNote(health: ExtensionHealth): string | undefined {
+  if (health.ok) return undefined;
+  return `extension coverage incomplete: ${health.issues.map(issue => `${issue.id.slice(0, 12)}: ${issue.reasonCode}`).join(", ")}; verify missing relationships in source${health.retryAt === undefined ? "; run graft build after correcting the extension failure" : "; automatic retry is subject to a cooldown"}`;
 }
 
 /** What moved since the last build. Empty in all three arrays = nothing to do. */
@@ -82,6 +142,12 @@ export function readFingerprint(outDir: string): Fingerprint | null {
   const f = readJson<Fingerprint>(fingerprintPath(outDir));
   if (!f || f.version !== FINGERPRINT_VERSION || typeof f.files !== "object" || !f.files) return null;
   if (f.extractor !== stamp()) return null; // different extractor — re-extract, don't trust these prints
+  // wiring.json and its optional cache are separate atomic writes. A read-only
+  // cache may retain an old success after the graph drops extension edges.
+  // Compare deterministic execution identities, reusing the query's graph cache.
+  if ((f.extensions || f.extensionBuild) && f.extensionBuild?.stamp !== loadGraphCached(outDir)?.meta?.extensionState) {
+    return { ...f, extensionBuild: undefined, extensionInputs: undefined };
+  }
   return f;
 }
 
@@ -93,6 +159,10 @@ export function writeFingerprint(
   entries: Record<string, ExtractEntry>,
   onlyDirs?: string[],
   root?: string,
+  extensionStamp?: string,
+  extensionInputs?: string[],
+  extensionInputExclusions?: string[],
+  extensionRuns?: ExtensionRun[],
 ): boolean {
   const files: Record<string, Print> = {};
   for (const [rel, e] of Object.entries(entries)) files[rel] = [e.size, e.mtimeMs, e.hash];
@@ -106,6 +176,16 @@ export function writeFingerprint(
   }
   try {
     const record: Fingerprint = { version: FINGERPRINT_VERSION, extractor: stamp(), files };
+    const extensions = extensionStamp ?? (root ? extensionFingerprint(root) : "");
+    if (extensions) record.extensions = extensions;
+    if (extensionInputs !== undefined) record.extensionInputs = [...new Set(extensionInputs)].sort();
+    if (extensionInputExclusions !== undefined) record.extensionInputExclusions = [...extensionInputExclusions];
+    if (extensionRuns && (extensions || extensionRuns.length)) record.extensionBuild = {
+      stamp: extensionExecutionStamp(extensions, extensionRuns),
+      attemptedAt: Date.now(),
+      runs: extensionRuns.map(({ id, digest, status, reasonCode, inputFingerprint }) => ({ id, digest, status,
+        ...(reasonCode ? { reasonCode } : {}), ...(inputFingerprint ? { inputFingerprint } : {}) })),
+    };
     if (onlyDirs && onlyDirs.length > 0) record.onlyDirs = onlyDirs;
     writeJsonAtomic(fingerprintPath(outDir), record, true);
     pruneSidecars(join(outDir, CACHE_DIR), FINGERPRINT_PREFIX);
@@ -165,6 +245,8 @@ export function probeDrift(root: string, outDir: string): Drift | null {
   if (!fp) return null;
 
   const drift: Drift = { changed: [], added: [], removed: [] };
+  if ((fp.extensions ?? "") !== extensionFingerprint(root)) drift.changed.push("[extensions]");
+  if (extensionInputsChanged(root, fp, outDir)) drift.changed.push("[extension inputs]");
   const seen = new Set<string>();
 
   const onlyDirs = fp.onlyDirs && fp.onlyDirs.length > 0 ? new Set(fp.onlyDirs) : undefined;
@@ -218,6 +300,20 @@ export function probeDrift(root: string, outDir: string): Drift | null {
   drift.added.sort();
   drift.removed.sort();
   return drift;
+}
+
+/** A build using two different source views cannot be fresh against just one.
+ * Unknown/malformed stamps fail closed; explicit skipped executions need no
+ * repository read and do not cause a rebuild loop when isolation is unavailable. */
+export function extensionInputsChanged(root: string, fingerprint: Fingerprint | null, outDir?: string): boolean {
+  if (!fingerprint) return false; // The caller handles a wholly missing fingerprint.
+  const stamps = fingerprint.extensionInputs;
+  if (stamps === undefined) return Boolean(fingerprint.extensions);
+  if (!Array.isArray(stamps) || stamps.length > 8 || stamps.some(stamp => typeof stamp !== "string" || !/^[a-f0-9]{64}$/.test(stamp))) return true;
+  if (stamps.length === 0) return false;
+  if (outDir && JSON.stringify(extensionOutputExclusions(root, outDir)) !== JSON.stringify(fingerprint.extensionInputExclusions ?? [])) return true;
+  const current = extensionInputFingerprint(root, fingerprint.extensionInputExclusions ?? []);
+  return current === null || stamps.some(stamp => stamp !== current);
 }
 
 /** `[size, mtimeMs, hash]` for a tracked non-source file, or null when it is absent.

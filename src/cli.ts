@@ -40,6 +40,9 @@ import { homedir } from "node:os";
 import { formatUpgradeReport, formatVersionReport, getNpmViewVersion, readCurrentVersion, runUpgrade } from "./cli-meta.js";
 import { patchBuildConfig, type BuildConfig } from "./util/state.js";
 import { normalizePathPrefix } from "./util/paths.js";
+import { approveExtension, extensionRuns, listExtensions, revokeExtension } from "./graph/extensions.js";
+import { extensionDisplayJson, extensionDisplayText } from "./graph/extension-runtime.js";
+import { readFileSync } from "node:fs";
 import { latestSession, formatSessionStats, sessionInputRate } from "./claude/session-metrics.js";
 import { setInputRate } from "./context/savings.js";
 import { formatUpdateNudge, maybeRefreshInBackground, readUpdateCache, refreshUpdateCache, writeStamp } from "./upkeep.js";
@@ -211,7 +214,8 @@ const UPKEEP_SKIP = new Set(["version", "upgrade", "_update-check", "mcp"]);
  * cache filler for the hooks, which are not allowed to touch the network.
  */
 program.hook("preAction", (_parent, action) => {
-  if (UPKEEP_SKIP.has(action.name())) return;
+  if (UPKEEP_SKIP.has(action.name()) || action.parent?.name() === "ext"
+    || (action.name() === "build" && action.opts().dryRun)) return;
   maybeRefreshInBackground();
   const nudge = formatUpdateNudge(currentVersion, readUpdateCache()?.latest);
   if (nudge) console.error(nudge);
@@ -305,6 +309,7 @@ program
       "Add --deep for the LLM concept map + per-symbol summaries/crux.",
   )
   .argument("[dir]", "repository root", ".")
+  .option("--dry-run", "list locally registered graph extensions without running them or writing a graph")
   .option("--deep", "run the LLM pass: concept nodes (graft/*.md) + per-symbol summary/crux")
   .option("-e, --extensions <exts...>", 'code extensions to include (e.g. ".ts" ".py"); an extension with no parser is ignored with a warning that lists the supported set')
   .option("-j, --concurrency <n>", "files summarized in parallel during --deep (default 5)")
@@ -349,6 +354,7 @@ program
     dir: string,
     opts: {
       deep?: boolean;
+      dryRun?: boolean;
       extensions?: string[];
       concurrency?: string;
       reuse?: boolean;
@@ -363,6 +369,12 @@ program
     },
     command: Command,
   ) => {
+    if (opts.dryRun) {
+      return extensionAction(() => {
+        const extensions = listExtensions(resolve(dir));
+        console.log(extensionDisplayJson({ repo: resolve(dir), dryRun: true, extensions }));
+      })();
+    }
     const buildStartedAt = Date.now();
     if (opts.gitignore === false) process.env.GRAFT_NO_GITIGNORE = "1";
     if (opts.ignore === false) process.env.GRAFT_NO_IGNORE = "1";
@@ -526,6 +538,10 @@ program
       },
       { repo: buildRoot },
     );
+    for (const run of g.extensionRuns ?? []) {
+      console.log(`  extension ${run.id.slice(0, 12)}: ${run.status}, ${run.nodes} nodes, ${run.edges} edges (${run.durationMs}ms)`);
+      for (const line of run.log) console.error(`  [extension] ${extensionDisplayText(line)}`);
+    }
     for (const e of g.errors) console.error(`✗ ${e}`);
 
     const rel = relative(process.cwd(), g.contextDir) || "graft";
@@ -1189,6 +1205,48 @@ program
         : "\n✓ graft fully removed. `graft init` re-wires from scratch.",
     );
   });
+
+function extensionAction<T extends unknown[]>(action: (...args: T) => void): (...args: T) => void {
+  return (...args) => {
+    try { action(...args); }
+    catch (error) { throw new Error(extensionDisplayText(error instanceof Error ? error.message : error)); }
+  };
+}
+
+const ext = program.command("ext").description("Approve and inspect local graph extensions (code execution is off until explicitly allowed)");
+ext.command("allow")
+  .description("Approve this module's complete local package and configuration for one repository; package changes require renewed approval")
+  .argument("<module>", "explicit path to an ES module in a dedicated extension directory")
+  .argument("[repo]", "repository root", ".")
+  .option("--config <file>", "JSON object supplied to the extension as config")
+  .action(extensionAction((module: string, repo: string, options: { config?: string }) => {
+    const config: unknown = options.config ? JSON.parse(readFileSync(resolve(options.config), "utf8")) : {};
+    const grant = approveExtension(resolve(repo), resolve(module), config);
+    console.log(`Allowed ${extensionDisplayText(grant.path)}\n  repository: ${extensionDisplayText(grant.repo)}\n  id: ${grant.id}\n  package digest: ${grant.digest}\n  Runs during builds and automatic refreshes in OS isolation. Package/configuration changes require renewed approval.`);
+  }));
+ext.command("list")
+  .description("List local approvals and current package integrity; never execute them")
+  .argument("[repo]", "repository root", ".")
+  .option("--json", "machine-readable output")
+  .action(extensionAction((repo: string, options: { json?: boolean }) => {
+    const registrations = listExtensions(resolve(repo));
+    if (options.json) console.log(extensionDisplayJson(registrations));
+    else if (!registrations.length) console.log("No graph extensions approved for this repository.");
+    else for (const g of registrations) console.log(`${g.id}  ${g.status}  ${extensionDisplayText(g.path)}${g.reason ? ` — ${extensionDisplayText(g.reason)}` : ""}`);
+  }));
+ext.command("revoke")
+  .description("Revoke a local approval; the next build or refresh removes its contributions")
+  .argument("<id-or-path>", "extension id or explicit module path")
+  .argument("[repo]", "repository root", ".")
+  .action(extensionAction((id: string, repo: string) => {
+    if (!revokeExtension(resolve(repo), id)) { console.error("No matching extension approval."); process.exitCode = 1; return; }
+    console.log("Extension approval revoked. Its contributions will be removed on the next build or refresh.");
+  }));
+ext.command("status")
+  .description("Show the last 100 persisted extension run events (no extension source or log text)")
+  .argument("[repo]", "repository root", ".")
+  .option("--json", "machine-readable output")
+  .action(extensionAction((repo: string) => { console.log(extensionDisplayJson(extensionRuns(resolve(repo)))); }));
 
 program.parseAsync().catch((err) => {
   console.error(err instanceof Error ? err.message : err);

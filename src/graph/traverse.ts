@@ -114,18 +114,19 @@ function symbolMatches(nodes: NodeV1[], lowerQuery: string): NodeV1[] {
 /** One traversed edge. `node` is null when the edge's other endpoint isn't a
  * real node in the graph (e.g. an unresolved import module string) — such
  * hits are kept, labeled by the raw id, rather than dropped. */
-export type WorkflowEvidence = Pick<Partial<EdgeV1>, "confidence" | "via">;
+export type ExtensionEvidence = Pick<Partial<EdgeV1>, "origin" | "extension" | "extensionDigest" | "confidence" | "via">;
 
-/** Conditional workflow edges must keep their provenance through
+/** Route joins and conditional workflow edges must keep their provenance through
  * the walk; otherwise a guarded enqueue reads like an unconditional invocation. */
-export function workflowEvidence(edge: Partial<EdgeV1>): WorkflowEvidence {
+export function extensionEvidence(edge: Partial<EdgeV1>): ExtensionEvidence {
+  if (edge.origin === "extension") return { origin: edge.origin, extension: edge.extension, extensionDigest: edge.extensionDigest, confidence: edge.confidence, ...(edge.via ? { via: edge.via } : {}) };
   if (edge.relation === "enqueues" || edge.relation === "dispatches") return {
     ...(edge.confidence ? { confidence: edge.confidence } : {}), ...(edge.via ? { via: edge.via } : {}),
   };
   return {};
 }
 
-export interface EdgeHit extends WorkflowEvidence {
+export interface EdgeHit extends ExtensionEvidence {
   node: NodeV1 | null;
   id: string;
   relation: Relation;
@@ -138,7 +139,7 @@ export function callersOf(graph: GraphV1, symbol: NodeV1): EdgeHit[] {
   const hits: EdgeHit[] = [];
   for (const e of graph.edges as EdgeV1[]) {
     if (!WALK_RELATIONS.has(e.relation) || e.target !== symbol.id) continue;
-    hits.push({ node: byId.get(e.source) ?? null, id: e.source, relation: e.relation, depth: 1, ...workflowEvidence(e) });
+    hits.push({ node: byId.get(e.source) ?? null, id: e.source, relation: e.relation, depth: 1, ...extensionEvidence(e) });
   }
   return hits;
 }
@@ -149,7 +150,7 @@ export function calleesOf(graph: GraphV1, symbol: NodeV1): EdgeHit[] {
   const hits: EdgeHit[] = [];
   for (const e of graph.edges as EdgeV1[]) {
     if (!WALK_RELATIONS.has(e.relation) || e.source !== symbol.id) continue;
-    hits.push({ node: byId.get(e.target) ?? null, id: e.target, relation: e.relation, depth: 1, ...workflowEvidence(e) });
+    hits.push({ node: byId.get(e.target) ?? null, id: e.target, relation: e.relation, depth: 1, ...extensionEvidence(e) });
   }
   return hits;
 }
@@ -207,7 +208,7 @@ export function impactOfMany(graph: GraphV1, seeds: NodeV1[], maxDepth = 2, dire
       for (const { other, edge } of adj.get(current) ?? []) {
         if (visited.has(other)) continue;
         visited.add(other);
-        hits.push({ node: byId.get(other) ?? null, id: other, relation: edge.relation, depth, ...workflowEvidence(edge) });
+        hits.push({ node: byId.get(other) ?? null, id: other, relation: edge.relation, depth, ...extensionEvidence(edge) });
         next.push(other);
       }
     }

@@ -37,7 +37,7 @@ import { contextDirFor } from "../context/node-file.js";
 import { acquireLockIn, releaseLockIn } from "../util/state.js";
 import { CACHE_DIR } from "../context/node-file.js";
 import { buildGraph } from "./build.js";
-import { driftCount, isClean, probeDrift, readFingerprint, type Drift } from "./fingerprint.js";
+import { driftCount, extensionHealth, extensionHealthNote, isClean, probeDrift, readFingerprint, type Drift } from "./fingerprint.js";
 import { invalidateGraphCaches } from "./load.js";
 import { seedGraph, type SeedResult } from "./seed.js";
 import { wiringPath } from "./write.js";
@@ -148,10 +148,19 @@ async function seedUnderLock(
  * the context dir.
  */
 export async function ensureFreshGraph(root: string, opts: RefreshOptions = {}): Promise<RefreshResult> {
-  if (opts.disabled || envDisabled()) return CLEAN;
   try {
     const dir = resolve(root);
     const outDir = contextDirFor(dir, opts.contextDir);
+    const coverage = () => extensionHealth(readFingerprint(outDir));
+    const currentNote = (prefix?: string): RefreshResult => {
+      const note = [prefix, extensionHealthNote(coverage())].filter(Boolean).join("; ");
+      return note ? { refreshed: false, note } : CLEAN;
+    };
+    const retryDue = () => {
+      const health = coverage();
+      return !health.ok && health.retryAt !== undefined && health.retryAt <= Date.now();
+    };
+    if (opts.disabled || envDisabled()) return currentNote();
     let seededFrom: string | undefined;
     if (!existsSync(wiringPath(outDir))) {
       // One case has a graph to work with even though this checkout has none: a git
@@ -177,7 +186,7 @@ export async function ensureFreshGraph(root: string, opts: RefreshOptions = {}):
     // or by a different extractor build. Rebuild once — that lays the fingerprint
     // down, so it costs exactly one build, not one per query.
     const drift = probeDrift(dir, outDir);
-    if (drift && isClean(drift)) return seedNote ? { refreshed: false, note: seedNote } : CLEAN;
+    if (drift && isClean(drift) && !retryDue()) return currentNote(seedNote);
 
     // On the default layout this is `<root>/graft/.cache/.sync.lock`, the very file
     // the Claude Code hooks lock — so this refresh and the background sync can
@@ -188,7 +197,7 @@ export async function ensureFreshGraph(root: string, opts: RefreshOptions = {}):
       return {
         refreshed: false,
         drift: drift ?? undefined,
-        note: seedNote ? `${seedNote}; ${busy}` : busy,
+        note: currentNote(seedNote ? `${seedNote}; ${busy}` : busy).note,
       };
     }
     const unhook = releaseOnSignal(lockCache);
@@ -200,9 +209,9 @@ export async function ensureFreshGraph(root: string, opts: RefreshOptions = {}):
       // of them pure waste, and the last tool call pays for all of it. A null drift
       // means "no fingerprint" and still has to build.
       const now = drift ? probeDrift(dir, outDir) : null;
-      if (now && isClean(now)) {
+      if (now && isClean(now) && !retryDue()) {
         invalidateGraphCaches(outDir);
-        return seedNote ? { refreshed: false, note: seedNote } : CLEAN;
+        return currentNote(seedNote);
       }
       // Tier-1 only: no summarizer, so no LLM call and no network, ever. And
       // `graphOnly`: write the graph, the ask sidecar and the fingerprint, nothing
@@ -215,7 +224,7 @@ export async function ensureFreshGraph(root: string, opts: RefreshOptions = {}):
       const onlyDirs = readFingerprint(outDir)?.onlyDirs;
       await buildGraph(dir, { contextDir: opts.contextDir, graphOnly: true, onlyDirs });
       invalidateGraphCaches(outDir);
-      return { refreshed: true, drift: drift ?? undefined, note: seedNote };
+      return { refreshed: true, drift: drift ?? undefined, note: currentNote(seedNote).note };
     } finally {
       unhook();
       releaseLockIn(lockCache);
@@ -237,8 +246,8 @@ export async function ensureFreshChildren(
   children: string[],
   opts: RefreshOptions = {},
 ): Promise<RefreshResult> {
-  if (opts.disabled || envDisabled()) return CLEAN;
   const refreshedIn: string[] = [];
+  const notes: string[] = [];
   let files = 0;
   for (const child of children) {
     // Deliberately NOT `opts`: `contextDirFor` returns an override verbatim and
@@ -249,14 +258,15 @@ export async function ensureFreshChildren(
     // clobbering the rest.) A child's graph always lives in its own `<child>/graft`,
     // which is exactly how `loadWorkspaceGraphs` reads them back.
     const r = await ensureFreshGraph(resolve(root, child), { disabled: opts.disabled });
+    if (r.note) notes.push(`${child}: ${r.note}`);
     if (!r.refreshed) continue;
     refreshedIn.push(child);
     files += r.drift ? driftCount(r.drift) : 0;
   }
-  if (!refreshedIn.length) return CLEAN;
+  if (!refreshedIn.length) return notes.length ? { refreshed: false, note: notes.join("; ") } : CLEAN;
   return {
     refreshed: true,
-    note: `refreshed ${refreshedIn.join(", ")} (${files || "?"} file${files === 1 ? "" : "s"} changed) before answering`,
+    note: [`refreshed ${refreshedIn.join(", ")} (${files || "?"} file${files === 1 ? "" : "s"} changed) before answering`, ...notes].join("; "),
   };
 }
 

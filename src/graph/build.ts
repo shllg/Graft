@@ -37,6 +37,8 @@ import { seedGraph, type SeedResult } from "./seed.js";
 import { filterByOnlyDirs, listSourceStats } from "./source-files.js";
 import { resolveEdges, type GoModule } from "./resolve.js";
 import { enrichGraph, type EnrichStats } from "./enrich.js";
+import { extensionOutputExclusions } from "./extension-runtime.js";
+import { enrichWithExtensions, extensionExecutionStamp, extensionFingerprint, type ExtensionRun } from "./extensions.js";
 import { readGraph, writeGraph, wiringPath } from "./write.js";
 import { writeCards, writeIndex, writeCovers, type CardStats } from "./cards.js";
 import { writeAskIndex } from "../ask/index-file.js";
@@ -123,6 +125,7 @@ export interface GraphBuildResult {
   byRelation: Record<Relation, number>;
   languages: string[];
   meaning: EnrichStats;
+  extensionRuns?: ExtensionRun[];
   errors: string[];
 }
 
@@ -352,6 +355,16 @@ export async function buildGraph(
     opts.onProgress?.({ phase: "enrich", index: r.added, total: r.queried, file: `lsp:${r.server ?? "none"}` });
   }
 
+  // Capture approval state before execution. A concurrent revocation must remain
+  // visible to the next query instead of blessing already-stale extension edges.
+  const extensionStamp = extensionFingerprint(root);
+  const extensionInputExclusions = extensionOutputExclusions(root, outDir);
+  const extensionRuns = await enrichWithExtensions(graph, root, {}, extensionInputExclusions);
+  for (const run of extensionRuns) {
+    if (run.status !== "ok") errors.push(`extension ${run.id}: ${run.reason ?? run.status}`);
+  }
+  const extensionState = extensionExecutionStamp(extensionStamp, extensionRuns);
+  if (extensionState) graph.meta.extensionState = extensionState;
   const graphPath = writeGraph(graph, outDir);
   // `ask`'s token/IDF sidecar — moves per-query corpus tokenization to build
   // time (~45% of query time on a 32k-node graph, profiled). Lives in the
@@ -370,11 +383,13 @@ export async function buildGraph(
     errors.push(`ask-index: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  // The fingerprint claims exactly one thing: "the graph on disk was built from
-  // these source bytes." Nothing about the projections below — which is why it is
-  // safe to write here, and why `graphOnly` builds (the query path, which stops
-  // right after this line) are still recorded as fresh.
-  writeFingerprint(outDir, entries, opts.onlyDirs, root);
+  // Source freshness and extension execution are recorded separately. A skipped
+  // extension leaves usable current core edges, but must not certify the missing
+  // coverage or suppress recovery. Nothing here claims the projections below
+  // succeeded; graphOnly builds need no cards to serve the structural graph.
+  writeFingerprint(outDir, entries, opts.onlyDirs, root, extensionStamp,
+    extensionRuns.flatMap(run => /^[a-f0-9]{64}$/.test(run.inputFingerprint ?? "") ? [run.inputFingerprint!] : []),
+    extensionInputExclusions, extensionRuns);
 
   // Tier-2 passive surface: project the nodes into per-file markdown cards, and
   // refresh the INDEX roster. Pure projection — no LLM, no network.
@@ -421,6 +436,7 @@ export async function buildGraph(
     byRelation,
     languages: [...langs].sort(),
     meaning,
+    ...(extensionRuns.length ? { extensionRuns } : {}),
     errors,
   };
 }

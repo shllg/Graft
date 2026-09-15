@@ -56,6 +56,9 @@ export interface AskHit {
   pointer: string;
   snippet: string;
   relation?: Relation;
+  /** Graph evidence for a structural hit, or one proved outgoing dependency
+   * accompanying a selected lexical symbol rather than independently ranked. */
+  evidence?: Pick<EdgeV1, "source" | "relation" | "confidence" | "origin" | "extension" | "extensionDigest" | "via">;
   related?: string[];
   score: number;
   /** The actual source at `pointer`, sliced from disk when `source` is on.
@@ -294,8 +297,8 @@ function matchedStrongTerms(
 
 const INCOMING = /\b(caller|callers|calls?\s+into|who\s+calls|what\s+calls|called\s+by|used\s+by|uses)\b/;
 const OUTGOING = /\b(callee|callees|what\s+does\s+\w+\s+call|calls\s+what|imports?|depends\s+on)\b/;
-const INCOMING_RELS: Relation[] = ["calls", "references", "implements", "extends"];
-const OUTGOING_RELS: Relation[] = ["calls", "references", "imports", "implements", "extends"];
+const INCOMING_RELS: Relation[] = ["calls", "references", "implements", "extends", "renders", "serves"];
+const OUTGOING_RELS: Relation[] = ["calls", "references", "imports", "implements", "extends", "renders", "serves"];
 
 /** Split a prose query into word-like tokens, keeping dots so a qualified name
  * ("Cache.get") or package-qualified name ("pkg.Fn") survives as one token —
@@ -374,6 +377,10 @@ function structural(query: string, graph: GraphV1, limit: number, inPrefix?: str
       pointer: node ? `${node.path}:${node.span}` : other,
       snippet: node?.summary?.split("\n")[0].trim() ?? node?.signature ?? "",
       relation: e.relation,
+      ...(e.origin === "extension" ? { evidence: {
+        source: e.source, relation: e.relation, confidence: e.confidence, origin: e.origin,
+        extension: e.extension, extensionDigest: e.extensionDigest, via: e.via,
+      } } : {}),
       score: 1,
     });
   }
@@ -633,6 +640,7 @@ function lexical(
   const symbolHits: AskHit[] = [];
   const baselineSymbolHits: AskHit[] = [];
   const baselineHitById = new Map<string, AskHit>();
+  const nodeIdByHit = new Map<AskHit, string>();
   const fileQueueHitsByGroup = new Map<string, () => AskHit[]>();
   const baselineQueueHitsByGroup = new Map<string, () => AskHit[]>();
   const fileGroups: AskRankingGroup[] = [];
@@ -648,6 +656,7 @@ function lexical(
       score: hitScore,
       ...(scope === undefined ? {} : { scope }),
     };
+    nodeIdByHit.set(hit, id);
     const d = docsById.get(id);
     matchedOf.set(
       hit,
@@ -1151,6 +1160,48 @@ function lexical(
           limit,
         )
       : scored;
+  let hits = selected.slice(0, limit);
+  // Scope-local walks intentionally omit cross-package edges (#117). A client
+  // match could therefore never surface its proved controller, even though the
+  // same renders dependency works within one scope. Include one explicit bridge
+  // per selected lexical symbol, without reconnecting scopes or reseeding walks.
+  // Keep the top hit and at least half the budget for ranked matches; appended
+  // endpoints are never anchors, and a high-fanout extension gets only one slot.
+  if (graphRank && graph && limit > 1) {
+    const anchors = new Set(hits.flatMap(hit => {
+      const id = nodeIdByHit.get(hit), node = id ? byId.get(id) : undefined;
+      return id && node?.kind !== "file" && (matchedOf.get(hit) ?? 0) > 0 ? [id] : [];
+    }));
+    const bridges = new Map<string, { edge: EdgeV1; key: string }>();
+    for (const edge of graph.edges) {
+      if (!anchors.has(edge.source) || (edge.relation !== "renders" && edge.relation !== "serves")) continue;
+      const target = byId.get(edge.target);
+      if (!target || edge.source === edge.target || (inPrefix && !pathUnderPrefix(target.path, inPrefix))) continue;
+      const key = JSON.stringify([edge.target, edge.relation, edge.origin, edge.extension, edge.extensionDigest, edge.via]);
+      const prior = bridges.get(edge.source);
+      if (!prior || key < prior.key) bridges.set(edge.source, { edge, key });
+    }
+    const expanded: AskHit[] = [], seen = new Set<string>();
+    let evidenceCount = 0;
+    for (const hit of hits) {
+      if (expanded.length >= limit) break;
+      const id = nodeIdByHit.get(hit), identity = id ?? `${hit.kind}\0${hit.pointer}`;
+      if (seen.has(identity)) continue;
+      expanded.push(hit); seen.add(identity);
+      const edge = id ? bridges.get(id)?.edge : undefined;
+      if (!edge || seen.has(edge.target) || expanded.length >= limit || evidenceCount >= Math.floor(limit / 2)) continue;
+      const target = byId.get(edge.target)!;
+      const { source, relation, confidence, origin, extension, extensionDigest, via } = edge;
+      expanded.push({
+        kind: "callee", title: `${target.name} · ${target.kind}`, pointer: `${target.path}:${target.span}`,
+        snippet: target.summary?.split("\n")[0].trim() ?? target.signature ?? "",
+        relation, evidence: { source, relation, confidence, origin, extension, extensionDigest, via },
+        score: hit.score, ...(scopes && scopes.length > 1 ? { scope: scopeOf(target.path, scopes).prefix } : {}),
+      });
+      seen.add(edge.target); evidenceCount++;
+    }
+    hits = expanded;
+  }
   const top = selected[0] ?? scored[0];
   if (fileTopLock && top?.scope && scopeMeta) {
     scopeMeta = {
@@ -1182,7 +1233,7 @@ function lexical(
   return {
     query,
     mode: scored.length ? "lexical" : "empty",
-    hits: selected.slice(0, limit),
+    hits,
     scopes: scopeMeta,
     coverage: top && q.size > 0 ? matchedOf.get(top) ?? 0 : undefined,
     coverageStrong: top && q.size > 0 ? matchedStrongOf.get(top) ?? 0 : undefined,
@@ -1484,6 +1535,7 @@ export function formatAsk(r: AskResult): string {
     for (const h of r.hits) {
       const tail = h.snippet ? ` — ${h.snippet}` : "";
       lines.push(`- ${h.title}  ${h.pointer}  (${h.relation})${tail}`);
+      if (h.evidence) lines.push(`  [extension ${h.evidence.extension?.slice(0, 12)}]${h.evidence.via ? ` ${h.evidence.via}` : ""}`);
       if (h.code) lines.push("", "```", h.code, "```", "");
     }
   } else {
@@ -1493,6 +1545,10 @@ export function formatAsk(r: AskResult): string {
       const label = r.scopes && h.scope ? `[${h.scope}/] ` : "";
       lines.push(`${i + 1}. ${label}${h.title}  [${h.kind}]`);
       lines.push(`   ${h.pointer}`);
+      if (h.evidence) {
+        const proof = h.evidence.origin === "extension" ? ` [extension ${h.evidence.extension?.slice(0, 12)}]` : "";
+        lines.push(`   ${h.evidence.relation} from ${h.evidence.source}${proof}${h.evidence.via ? `; ${h.evidence.via}` : ""}`);
+      }
       if (h.snippet) lines.push(`   ${h.snippet}`);
       if (h.related?.length) lines.push(`   related: ${h.related.join(", ")}`);
       if (h.code) lines.push("", "```", h.code, "```");

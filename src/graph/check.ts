@@ -28,13 +28,17 @@ import { walkDir } from "../ingest/fs.js";
 import { readFollowNestedRepos, readFollowSubmodules, readIncludeDirs } from "../util/state.js";
 import { discoverZeitwerk } from "./zeitwerk.js";
 import { readGraph, wiringPath } from "./write.js";
-import { readFingerprint } from "./fingerprint.js";
+import { extensionHealth, extensionHealthNote, extensionInputsChanged, readFingerprint, type ExtensionHealth } from "./fingerprint.js";
+import { extensionFingerprint, extensionNodeHashes } from "./extensions.js";
 import { readSourceFile } from "../util/source.js";
 
 export interface GraphCheckResult {
   ok: boolean;
   /** True when there is no graph.json (a graph has never been built). */
   missing: boolean;
+  /** Approval, package integrity or registration changed since the build. */
+  extensionsChanged?: boolean;
+  extensionHealth?: ExtensionHealth;
   added: string[];
   removed: string[];
   changed: string[];
@@ -87,7 +91,12 @@ export async function checkGraph(
   // A `--only-dir` build records its whitelist in the fingerprint; read it back
   // so `check` diffs the same limited set instead of flagging every excluded
   // file as "added".
-  const fpOnlyDirs = readFingerprint(outDir)?.onlyDirs;
+  const fingerprint = readFingerprint(outDir);
+  if (fingerprint?.extensions || fingerprint?.extensionBuild) result.extensionHealth = extensionHealth(fingerprint);
+  const fpOnlyDirs = fingerprint?.onlyDirs;
+  result.extensionsChanged = (fingerprint?.extensions ?? "") !== extensionFingerprint(root) || extensionInputsChanged(root, fingerprint, outDir) ||
+    (!fingerprint && (committed.nodes.some(n => n.origin === "extension") ||
+      committed.edges.some(e => e.origin === "extension")));
   const onlyDirs = fpOnlyDirs && fpOnlyDirs.length > 0 ? new Set(fpOnlyDirs) : undefined;
   const repoFiles = filterByOnlyDirs(walkDir(root, readIncludeDirs(root), {
     followSubmodules: readFollowSubmodules(root),
@@ -110,7 +119,9 @@ export async function checkGraph(
   await warmContainerGrammars(
     new Set(sourceFiles.map((f) => containerLangOf(f)?.name).filter((n): n is string => !!n)),
   );
-  const current = new Map<string, string>(); // id → body_hash
+  // Extension nodes have no parser definition to rediscover. Revalidate their
+  // host-hashed source spans instead; check must never execute extension code.
+  const current = extensionNodeHashes(root, committed.nodes); // id → body_hash
   for (const file of sourceFiles) {
     // The same three-way branch `buildGraph` uses, in the same order. The two must
     // stay in step: a tier the build extracts and the check cannot see reports as
@@ -169,6 +180,8 @@ export async function checkGraph(
   }
 
   result.ok =
+    !result.extensionsChanged &&
+    result.extensionHealth?.ok !== false &&
     result.added.length === 0 &&
     result.removed.length === 0 &&
     result.changed.length === 0 &&
@@ -189,8 +202,11 @@ export function formatGraphCheckReport(r: GraphCheckResult): string {
     return `graph check: OK — the wiring graph is in sync with the code.${note}`;
   }
 
-  const lines: string[] = ["graph check: STALE", ""];
   const structural = r.added.length + r.removed.length + r.changed.length;
+  const degraded = r.extensionHealth?.ok === false;
+  const lines: string[] = [`graph check: ${degraded && !r.extensionsChanged && !structural && !r.stale.length ? "DEGRADED" : "STALE"}`, ""];
+  if (r.extensionsChanged) lines.push("extensions changed: rebuild to apply the current approvals and package integrity state.");
+  if (degraded) lines.push(extensionHealthNote(r.extensionHealth!)!);
   if (r.changed.length) {
     lines.push(`changed (${r.changed.length}):`);
     for (const id of r.changed) lines.push(`  ~ ${id}`);

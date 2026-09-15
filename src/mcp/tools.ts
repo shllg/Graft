@@ -193,8 +193,8 @@ async function callWorkspaceTool(
       return { text: federateMap(root, dirOverride, { maxDirs }), isError: false };
     }
     case 'graft_check_freshness': {
-      const { text } = await federateCheck(root, dirOverride);
-      return { text, isError: false };
+      const { text, ok } = await federateCheck(root, dirOverride);
+      return { text, isError: !ok };
     }
     default:
       return null;
@@ -275,7 +275,7 @@ async function callSingleTool(
         const g = await engine.checkGraph(root);
         const parts = [formatCheckReport(r)];
         if (!g.missing) parts.push(formatGraphCheckReport(g));
-        return { text: parts.join('\n\n'), isError: false };
+        return { text: parts.join('\n\n'), isError: g.extensionHealth?.ok === false };
       }
       case 'graft_trace_calls': {
         // One tool covers callers (direction:in, the default), callees

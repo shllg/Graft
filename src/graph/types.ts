@@ -65,7 +65,10 @@ export type Confidence =
   | "ruby_dispatch" // a known possible runtime receiver, never an exhaustive call set
   | "ruby_injection" // conditional keyword/default binding with source evidence
   | "convention"
-  | "inferred";
+  | "inferred"
+  // A locally approved extension contributed this edge. It is never promoted to
+  // resolver confidence merely because the extension returned that string.
+  | "extension";
 
 /** Whether the LLM meaning-layer has been computed for a node. */
 export type SummaryState = "pending" | "ready" | "stale";
@@ -104,7 +107,9 @@ export interface NodeV1 {
   // Ruby's `attr_accessor` synthesis (M0 Phase 5) deliberately stays "ast": it
   // predates this value, it is plain Ruby rather than a framework vocabulary, and
   // re-stamping it would churn every existing Ruby graph for no new information.
-  origin: "ast" | "generic" | "synthesized";
+  origin: "ast" | "generic" | "synthesized" | "extension";
+  extension?: string;
+  extensionDigest?: string;
   body_hash: string; // sha256 of the definition text; the Tier-2 re-run trigger
   chars?: number; // byte length of the WHOLE file (file nodes only); the baseline
   //                 `ask` uses to estimate tokens saved vs reading the file whole
@@ -152,6 +157,9 @@ export type Relation =
   // for the precision of these edges SPECIFICALLY — the lesson of T7b is that a
   // claim mixed into a larger number is a claim the harness cannot check.
   | "renders"
+  // A frontend request reaches the controller action serving it. Keeping this
+  // separate prevents route-derived cross-language wiring from becoming calls.
+  | "serves"
   | "enqueues" // schedules asynchronous execution
   | "dispatches"; // conditional runtime/framework target, with evidence in via
 
@@ -160,6 +168,9 @@ export interface EdgeV1 {
   target: string; // node id, or an unresolved module string for imports
   relation: Relation;
   confidence: Confidence;
+  origin?: "extension";
+  extension?: string;
+  extensionDigest?: string;
   /** The declaration or receiver condition that justified this edge. */
   via?: string;
 }
@@ -180,6 +191,8 @@ export interface GraphV1 {
     nodeCount: number;
     edgeCount: number;
     languages: string[];
+    /** Deterministic identity of the approved extension execution outcomes. */
+    extensionState?: string;
     /** Ranking scopes: posix path prefixes relative to the graph root, "" = root scope.
      * Absent (old graphs) ≡ [{ prefix: "", label: "" }]. Sorted by prefix length desc. */
     scopes?: ScopeV1[];

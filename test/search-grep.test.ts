@@ -96,7 +96,7 @@ test('WALK_RELATIONS (shared, src/graph/relations.ts): exactly the dependency re
     // `renders` joined at M4: a controller action reaching its template is a real
     // dependency — rename the view and the action breaks — so an impact walk that
     // stopped at the Ruby would under-report every server-rendered change.
-    ['calls', 'dispatches', 'enqueues', 'extends', 'implements', 'imports', 'references', 'renders'].sort(),
+    ['calls', 'dispatches', 'enqueues', 'extends', 'implements', 'imports', 'references', 'renders', 'serves'].sort(),
   );
   // Excluded on purpose: contains is structural (file->symbol), not dependency wiring.
   assert.equal(WALK_RELATIONS.has('contains' as never), false);

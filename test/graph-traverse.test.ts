@@ -11,6 +11,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { resolveSymbol, callersOf, calleesOf, impactOf, impactOfMany, impactOfFile } from "../src/graph/traverse.js";
+import { hitLine } from "../src/graph/traverse-cli.js";
 import type { EdgeV1, GraphV1, NodeV1, Relation } from "../src/graph/types.js";
 
 function nodeStub(partial: Partial<NodeV1> & { id: string }): NodeV1 {
@@ -222,6 +223,16 @@ test("callersOf / calleesOf: no edges → empty array", () => {
   const g = baseGraph();
   assert.deepEqual(callersOf(g, hashFn), []);
   assert.deepEqual(calleesOf(g, hashFn), []);
+});
+
+test("direct and transitive walks retain extension route evidence", () => {
+  const proof = { origin: "extension" as const, confidence: "extension" as const, extension: "a".repeat(64), extensionDigest: "b".repeat(64), via: "GET /calendars" };
+  const g = graphOf([cacheGet, widgetRender], [{ source: cacheGet.id, target: widgetRender.id, relation: "serves", ...proof }]);
+  for (const hits of [callersOf(g, widgetRender), calleesOf(g, cacheGet), impactOf(g, widgetRender), impactOfMany(g, [cacheGet], 2, "out")]) {
+    assert.equal(hits.length, 1);
+    for (const [key, value] of Object.entries(proof)) assert.equal((hits[0] as unknown as Record<string, unknown>)[key], value);
+    assert.match(hitLine("in", hits[0], false), /extension.*GET \/calendars/);
+  }
 });
 
 // ── impactOf ─────────────────────────────────────────────────────────────

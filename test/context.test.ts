@@ -12,6 +12,9 @@ import { buildContext } from "../src/context/build.js";
 import { checkContext, indexFreshness, staleBanner } from "../src/context/check.js";
 import { contextDirFor, ensureGitignored, ensureSearchable } from "../src/context/node-file.js";
 import { buildGraph } from "../src/graph/build.js";
+import { checkGraph } from "../src/graph/check.js";
+import { fingerprintPath } from "../src/graph/fingerprint.js";
+import { readGraph, wiringPath, writeGraph } from "../src/graph/write.js";
 import { writeBuildConfig } from "../src/util/state.js";
 import { fakeProviders, PassthroughSummarizer } from "./helpers.js";
 import type { Synthesizer } from "../src/index.js";
@@ -448,6 +451,27 @@ test("graft check preserves Rails extraction context after a fresh build", () =>
   } finally {
     rmSync(dir, { recursive: true, force: true });
     rmSync(graph, { recursive: true, force: true });
+  }
+});
+
+test("check cannot certify extension contributions when their fingerprint is missing", async () => {
+  const dir = makeFixture();
+  const out = mkdtempSync(join(tmpdir(), "ctxgraph-missing-fingerprint-"));
+  try {
+    await buildGraph(dir, { contextDir: out });
+    const graph = readGraph(wiringPath(out))!;
+    graph.edges.push({ source: graph.nodes[0].id, target: graph.nodes[1].id,
+      relation: "serves", confidence: "extension", origin: "extension",
+      extension: "a".repeat(64), extensionDigest: "b".repeat(64) });
+    graph.meta.edgeCount = graph.edges.length;
+    writeGraph(graph, out);
+    rmSync(fingerprintPath(out));
+    const checked = await checkGraph(dir, { contextDir: out });
+    assert.equal(checked.extensionsChanged, true);
+    assert.equal(checked.ok, false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(out, { recursive: true, force: true });
   }
 });
 

@@ -68,6 +68,20 @@ test('graft callers --json: shape matches {query, matches:[{symbol,hits}]}', () 
   assert.equal(m.hits[0].depth, 1);
 });
 
+test('graft callers exposes extension evidence in human and JSON output', () => {
+  const d = builtRepo(), file = join(d, 'graft/.graph/wiring.json');
+  const graph = JSON.parse(readFileSync(file, 'utf8'));
+  const proof = { origin: 'extension', confidence: 'extension', extension: 'a'.repeat(64), extensionDigest: 'b'.repeat(64), via: 'GET /calendars' };
+  graph.edges.push({ source: 'src/math.ts#sub', target: 'src/math.ts#add', relation: 'serves', ...proof });
+  graph.meta.edgeCount = graph.edges.length;
+  writeFileSync(file, JSON.stringify(graph));
+  const result = runCli(['callers', 'add', d, '--json', '--no-refresh']);
+  assert.equal(result.status, 0);
+  const hit = JSON.parse(result.stdout).matches[0].hits.find((h: {relation: string}) => h.relation === 'serves');
+  for (const [key, value] of Object.entries(proof)) assert.equal(hit[key], value);
+  assert.match(runCli(['callers', 'add', d, '--no-refresh']).stdout, /extension aaaaaaaaaaaa; GET \/calendars/);
+});
+
 test('graft callers: unknown symbol exits 1 with a stderr message', () => {
   const d = builtRepo();
   const r = runCli(['callers', 'noSuchSymbolAnywhere', d]);

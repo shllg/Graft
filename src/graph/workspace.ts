@@ -25,6 +25,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 import { contextDirFor } from "../context/node-file.js";
 import { checkGraph } from "./check.js";
+import { extensionHealthNote } from "./fingerprint.js";
 import { loadGraphCached } from "./load.js";
 import { buildRepoMap, formatRepoMap } from "./map.js";
 import { discoverWorkspaceChildren } from "./scopes.js";
@@ -645,7 +646,10 @@ export async function federateCheck(
       if (g.removed.length) bits.push(`${g.removed.length} removed`);
       if (g.changed.length) bits.push(`${g.changed.length} changed`);
       if (g.stale.length) bits.push(`${g.stale.length} stale`);
-      lines.push(`${child}/: STALE (${bits.join(", ")})`);
+      if (g.extensionsChanged) bits.push("extension inputs or approvals changed");
+      const degraded = g.extensionHealth?.ok === false;
+      lines.push(`${child}/: ${degraded && !bits.length ? "DEGRADED" : "STALE"}${bits.length ? ` (${bits.join(", ")})` : ""}`);
+      if (degraded) lines.push(`  ${extensionHealthNote(g.extensionHealth!)}`);
     }
   }
   for (const child of wg.missing) lines.push(`${child}/: not built (run graft build)`);

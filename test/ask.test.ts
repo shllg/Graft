@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { buildGraph } from "../src/graph/build.js";
+import { readGraph, wiringPath, writeGraph } from "../src/graph/write.js";
 import { ask, formatAsk, skeleton, formatSkeleton, isTestPath } from "../src/ask/ask.js";
 
 test("isTestPath: de-ranks test files, not real source", () => {
@@ -568,6 +569,31 @@ test("ask: 'who calls Cache.get' resolves via qualified id-suffix (the previousl
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ask: structural dependency queries include bridge relations and their provenance", async () => {
+  for (const relation of ["renders", "serves"] as const) {
+    const dir = qualifiedFixture();
+    try {
+      await buildGraph(dir);
+      const out = join(dir, "graft");
+      const graph = readGraph(wiringPath(out))!;
+      graph.edges.push({ source: "cache.ts#loadItem", target: "cache.ts#unusedHelper",
+        relation, confidence: "extension", origin: "extension",
+        extension: "a".repeat(64), extensionDigest: "b".repeat(64), via: "verified dependency" });
+      writeGraph(graph, out);
+      for (const query of ["who calls unusedHelper", "what does loadItem call"]) {
+        const result = ask(dir, query);
+        assert.equal(result.mode, "structural");
+        const hit = result.hits.find(hit => hit.relation === relation);
+        assert.ok(hit, `${query} must include ${relation}`);
+        assert.equal(hit.evidence?.extensionDigest, "b".repeat(64));
+        assert.match(formatAsk(result), /extension.*verified dependency/);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 });
 

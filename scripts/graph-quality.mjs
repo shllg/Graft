@@ -17,8 +17,8 @@ import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
 const KINDS = new Set(["file","class","function","method","interface","type","enum","struct","module","constant","variable"]);
-const RELATIONS = new Set(["contains","calls","imports","references","implements","extends","renders", "enqueues", "dispatches"]);
-const CONFIDENCE = new Set(["lsp_resolved","lsp_dispatch","extracted","type_bound", "ruby_dispatch","ruby_injection","convention","inferred"]);
+const RELATIONS = new Set(["contains","calls","imports","references","implements","extends","renders","serves", "enqueues", "dispatches"]);
+const CONFIDENCE = new Set(["lsp_resolved","lsp_dispatch","extracted","type_bound", "ruby_dispatch","ruby_injection","convention","inferred","extension"]);
 
 const arg = process.argv[2] ?? ".";
 const json = process.argv.includes("--json");
@@ -33,8 +33,9 @@ const ids = new Set(nodes.map((n) => n.id));
 
 const bump = (m, k) => m.set(k, (m.get(k) ?? 0) + 1);
 const byKind = new Map(), byOrigin = new Map(), byRel = new Map(), byConf = new Map();
+const byExtension = new Map();
 for (const n of nodes) { bump(byKind, n.kind); bump(byOrigin, n.origin ?? "?"); }
-for (const e of edges) { bump(byRel, e.relation); bump(byConf, e.confidence); }
+for (const e of edges) { bump(byRel, e.relation); bump(byConf, e.confidence); if (e.origin === "extension") bump(byExtension, e.extension ?? "?"); }
 
 // ── invariants ──
 const problems = [];
@@ -46,6 +47,7 @@ for (const n of nodes) {
   const m = /^L(\d+)-L(\d+)$/.exec(n.span ?? "");
   if (!m) problems.push(`bad span '${n.span}': ${n.id}`);
   else if (Number(m[1]) > Number(m[2])) problems.push(`inverted span ${n.span}: ${n.id}`);
+  if (n.origin === "extension" && (!/^[a-f0-9]{64}$/.test(n.extension ?? "") || !/^[a-f0-9]{64}$/.test(n.extensionDigest ?? ""))) problems.push(`missing extension provenance: ${n.id}`);
 }
 // an edge target may be a node id OR a deliberately-unresolved external string
 // (import specifier / bare heritage name / unresolved Java annotation type);
@@ -57,10 +59,11 @@ for (const e of edges) {
   if (!ids.has(e.source)) { problems.push(`dangling source: ${e.source}`); dangling++; }
   const targetIsNode = ids.has(e.target);
   if (!targetIsNode) {
-    if (e.relation === "imports" || e.relation === "extends" || e.relation === "implements" || e.relation === "references") unresolvedExternal++;
+    if (e.origin !== "extension" && (e.relation === "imports" || e.relation === "extends" || e.relation === "implements" || e.relation === "references")) unresolvedExternal++;
     else { problems.push(`dangling ${e.relation} target: ${e.source} → ${e.target}`); dangling++; }
   }
   if (e.relation === "calls" && e.source === e.target) selfLoops++;
+  if ((e.origin === "extension" || e.confidence === "extension") && (e.origin !== "extension" || e.confidence !== "extension" || !/^[a-f0-9]{64}$/.test(e.extension ?? "") || !/^[a-f0-9]{64}$/.test(e.extensionDigest ?? ""))) problems.push(`invalid extension provenance: ${e.source}`);
 }
 
 // ── resolution / connectivity metrics ──
@@ -80,6 +83,7 @@ const report = {
   byOrigin: Object.fromEntries(byOrigin),
   byRelation: Object.fromEntries(byRel),
   byConfidence: Object.fromEntries(byConf),
+  byExtension: Object.fromEntries(byExtension),
   resolution: {
     calls: calls.length,
     resolvedToNode: resolvedCalls,
@@ -108,6 +112,7 @@ else {
   console.log(`  origin:     ${Object.entries(p.byOrigin).map(([k,v])=>`${k}=${v}`).join(" ")}`);
   console.log(`  relations:  ${Object.entries(p.byRelation).map(([k,v])=>`${k}=${v}`).join(" ")}`);
   console.log(`  confidence: ${Object.entries(p.byConfidence).map(([k,v])=>`${k}=${v}`).join(" ")}`);
+  if (byExtension.size) console.log(`  extension edges: ${Object.entries(p.byExtension).map(([k,v])=>`${k}=${v}`).join(" ")}`);
   console.log(`  calls resolved: ${p.resolution.resolvedToNode}/${p.resolution.calls} (${p.resolution.resolvedPct}%)`);
   console.log(`  orphan symbols: ${p.connectivity.orphanSymbolNodes}/${p.symbolNodes} (${p.connectivity.orphanPct}%)`);
   console.log(`  INVARIANTS: ${p.invariants.ok ? "OK ✓" : `FAIL ✗ (${p.invariants.violations} violations, ${p.invariants.danglingEdges} dangling)`}`);

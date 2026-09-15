@@ -16,7 +16,7 @@ import { fileReader, referenceLine, wordRe } from "../blast/evidence.js";
 import { contextDirFor } from "../context/node-file.js";
 import { withSavings, savingsFor, type Savings } from "../context/savings.js";
 import { loadGraphCached } from "./load.js";
-import { resolveSymbol, edgeWalk, workflowEvidence, type Direction, type EdgeHit, type WorkflowEvidence } from "./traverse.js";
+import { resolveSymbol, edgeWalk, extensionEvidence, type Direction, type EdgeHit, type ExtensionEvidence } from "./traverse.js";
 import type { GraphV1, NodeV1 } from "./types.js";
 
 export interface CallersCliOptions {
@@ -87,7 +87,8 @@ export function hitLine(direction: Direction, hit: EdgeHit, showDepth: boolean, 
   const label = hit.node ? `${hit.node.name} (${hit.node.path}:${hit.node.span})` : `${hit.id} (unresolved import)`;
   const workflowProof = hit.relation === "enqueues" || hit.relation === "dispatches"
     ? [hit.confidence, hit.via].filter(Boolean).join("; ") : "";
-  const proof = workflowProof ? ` [${workflowProof}]` : "";
+  const proof = hit.origin === "extension" ? ` [extension ${hit.extension?.slice(0, 12)}${hit.via ? `; ${hit.via}` : ""}]`
+    : workflowProof ? ` [${workflowProof}]` : "";
   const line = `  ${hit.relation} ${arrow} ${label}${depthTag}${proof}`;
   return quote ? `${line}\n      ${quote.n}: ${quote.text.trim()}` : line;
 }
@@ -162,7 +163,7 @@ interface MatchJson {
   hint?: string;
 }
 
-interface HitJson extends WorkflowEvidence {
+interface HitJson extends ExtensionEvidence {
   id: string;
   name?: string;
   kind?: string;
@@ -177,7 +178,7 @@ function symbolJson(n: NodeV1): SymbolJson {
 }
 
 function hitJson(hit: EdgeHit): HitJson {
-  const out: HitJson = { id: hit.id, relation: hit.relation, depth: hit.depth, ...workflowEvidence(hit) };
+  const out: HitJson = { id: hit.id, relation: hit.relation, depth: hit.depth, ...extensionEvidence(hit) };
   if (hit.node) {
     out.name = hit.node.name;
     out.kind = hit.node.kind;
